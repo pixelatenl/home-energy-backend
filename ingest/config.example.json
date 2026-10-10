@@ -1,0 +1,11 @@
+{
+  "entities": [
+    {
+      "haEntityId": "sensor.zonneplan_current_electricity_price",
+      "name": "Current electricity price",
+      "domain": "price",
+      "unit": "EUR/kWh",
+      "kind": "price"
+    }
+  ]
+}
