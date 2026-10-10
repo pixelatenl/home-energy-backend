@@ -1,0 +1,14 @@
+# Secrets: never commit these. deploy/deploy-db.sh and the worker
+# documentation describe how to create these files locally.
+.env
+
+# Local database data and backups.
+deploy/data/
+deploy/backups/
+
+# Ingest worker dependencies.
+ingest/node_modules/
+
+# Logs and system clutter.
+*.log
+.DS_Store
