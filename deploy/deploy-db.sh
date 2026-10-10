@@ -49,7 +49,7 @@ echo
 echo "== Tables =="
 docker exec ems-timescaledb psql -U ems -d energy -c "\dt"
 echo "== Materialized views (continuous aggregates) =="
-docker exec ems-timescaledb psql -U ems -d energy -c "\dm"
+docker exec ems-timescaledb psql -U ems -d energy -c "SELECT view_name FROM timescaledb_information.continuous_aggregates ORDER BY view_name;"
 echo "== Hypertables =="
 docker exec ems-timescaledb psql -U ems -d energy -c "SELECT hypertable_name FROM timescaledb_information.hypertables;"
 echo
