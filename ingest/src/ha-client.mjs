@@ -7,6 +7,11 @@
 // Uses the built-in WebSocket of Node.js (Node >= 22), so no ws package
 // is needed.
 
+/** Abort a connect attempt when the handshake and auth do not complete. */
+const CONNECT_TIMEOUT_MS = 10000;
+/** Abort the HTTP probe when Home Assistant does not answer. */
+const PROBE_TIMEOUT_MS = 5000;
+
 export class HaClient {
   /**
    * @param {object} options
@@ -29,18 +34,63 @@ export class HaClient {
     this.subscribed = false;
     this.backoffMs = 1000;
     this.stopped = false;
+    this.connectTimer = null;
   }
 
-  connect() {
+  /**
+   * Probe the plain HTTP endpoint before opening the WebSocket.
+   * The Docker proxy accepts TCP connections even while Home Assistant
+   * itself is still booting, which makes the WebSocket handshake hang
+   * forever without a timeout. Any HTTP response, including an error
+   * status, proves that Home Assistant is up.
+   */
+  async probe() {
+    const probeUrl = this.url.replace(/^ws/, "http");
+    try {
+      const res = await fetch(probeUrl, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      await res.arrayBuffer();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async connect() {
     if (this.stopped) return;
     this.log("Connecting to Home Assistant:", this.url);
-    this.ws = new WebSocket(this.url);
 
-    this.ws.onopen = () => {
+    if (!(await this.probe())) {
+      if (this.stopped) return;
+      this.retrySoon("Home Assistant is not reachable yet");
+      return;
+    }
+    if (this.stopped) return;
+
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+
+    this.connectTimer = setTimeout(() => {
+      if (this.stopped || this.ws !== ws) return;
+      this.log("Connection attempt timed out");
+      try {
+        // In the OPEN state this triggers onclose, which schedules the
+        // retry with backoff.
+        ws.close();
+      } catch {
+        // In the CONNECTING state close() is not allowed by the
+        // WebSocket specification. Abandon this socket (undici aborts
+        // it later) and schedule the retry here.
+        ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+        this.ws = null;
+        this.retrySoon(null);
+      }
+    }, CONNECT_TIMEOUT_MS);
+
+    ws.onopen = () => {
       // The server sends auth_required on its own; nothing to do here.
     };
 
-    this.ws.onmessage = (event) => {
+    ws.onmessage = (event) => {
       let msg;
       try {
         msg = JSON.parse(event.data);
@@ -50,24 +100,38 @@ export class HaClient {
       this.handleMessage(msg);
     };
 
-    this.ws.onclose = () => {
+    ws.onclose = () => {
+      clearTimeout(this.connectTimer);
       this.pending.clear();
       this.subscribed = false;
       if (this.stopped) return;
-      const wait = this.backoffMs;
-      this.backoffMs = Math.min(this.backoffMs * 2, 60000);
-      this.log("Connection closed; reconnecting in", wait, "ms");
-      setTimeout(() => this.connect(), wait);
+      this.retrySoon("Connection closed");
     };
 
-    this.ws.onerror = () => {
+    ws.onerror = () => {
       // onclose follows; the reconnection logic is handled there.
     };
   }
 
+  /** Schedule the next connect attempt with exponential backoff. */
+  retrySoon(reason) {
+    const wait = this.backoffMs;
+    this.backoffMs = Math.min(this.backoffMs * 2, 60000);
+    if (reason) this.log(reason + "; reconnecting in", wait, "ms");
+    else this.log("Reconnecting in", wait, "ms");
+    setTimeout(() => this.connect(), wait);
+  }
+
   stop() {
     this.stopped = true;
-    if (this.ws) this.ws.close();
+    clearTimeout(this.connectTimer);
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        // Still CONNECTING; there is nothing to close.
+      }
+    }
   }
 
   handleMessage(msg) {
@@ -76,6 +140,7 @@ export class HaClient {
       return;
     }
     if (msg.type === "auth_ok") {
+      clearTimeout(this.connectTimer);
       this.backoffMs = 1000;
       this.log("Authentication successful");
       this.afterAuth().catch((e) => this.log("Error while setting up subscription:", e.message));

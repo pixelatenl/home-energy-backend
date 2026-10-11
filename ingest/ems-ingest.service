@@ -1,0 +1,17 @@
+[Unit]
+Description=Home energy ingest worker
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the user name and the paths to your setup.
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/home-energy-backend/ingest
+EnvironmentFile=/home/YOUR_USER/home-energy-backend/ingest/.env
+ExecStart=/usr/bin/node src/index.mjs
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

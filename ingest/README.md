@@ -73,3 +73,23 @@ npm start         # start the worker (Ctrl-C shuts it down cleanly)
 | src/buckets.mjs | time intervals (5 minutes, hour) |
 | src/list-entities.mjs | helper script to look up entity ids |
 | test/engine.test.mjs | unit tests (node --test) |
+
+
+## Running as a systemd service
+
+For a production deployment, run the worker as a systemd service so it
+starts at boot and restarts after failures.
+
+1. Adjust the user name and paths in `ems-ingest.service` to your setup.
+2. Copy it to `/etc/systemd/system/ems-ingest.service`.
+3. Enable and start it:
+
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now ems-ingest.service
+
+4. Follow the logs with:
+
+   journalctl -u ems-ingest.service -f
+
+The service reads the same `.env` file as the manual setup, so no
+configuration change is needed.
