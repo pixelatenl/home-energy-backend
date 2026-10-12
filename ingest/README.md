@@ -3,8 +3,9 @@
 This worker is the bridge between Home Assistant and the TimescaleDB database. It subscribes to state changes via the WebSocket API, samples into 5-minute buckets and writes:
 
 - measurement samples (power, SOC, percentages) to `measurement`;
-- energy deltas per 5 minutes (derived from cumulative kWh meter readings; a meter reset yields delta 0) to `energy_delta`;
-- dynamic hourly prices (Zonneplan) to `price`, rounded down to the start of the hour.
+- energy deltas per 5 minutes (derived from cumulative meter readings; a meter reset yields delta 0) to `energy_delta`;
+- dynamic hourly electricity prices (Zonneplan) to `price`, rounded down to the start of the hour;
+- the daily gas price (Zonneplan) to `gas_price`, one row per local calendar day.
 
 ## Requirements
 
@@ -17,7 +18,7 @@ This worker is the bridge between Home Assistant and the TimescaleDB database. I
 ```bash
 cd ingest
 npm install
-cp .env.example .env   # fill in: HA_TOKEN and database details
+cp .env.example .env   # fill in: HA_TOKEN, database details, optionally EMS_TIMEZONE
 cp config.example.json config.json
 ```
 
@@ -31,21 +32,25 @@ Look up the correct `entity_id` values with the helper script (the search term i
 HA_WS_URL=ws://localhost:8123/api/websocket HA_TOKEN=... npm run list -- zonneplan
 ```
 
-Then add the entities to `config.json` with one of the three kinds:
+Then add the entities to `config.json` with one of the four kinds:
 
 ```json
 {
   "entities": [
     { "haEntityId": "sensor.current_electricity_price", "name": "Current electricity price", "domain": "price", "unit": "EUR/kWh", "kind": "price" },
     { "haEntityId": "sensor.house_power", "name": "House power", "domain": "grid", "unit": "kW", "kind": "sample" },
-    { "haEntityId": "sensor.grid_consumption_total", "name": "Grid consumption total", "domain": "grid", "unit": "kWh", "kind": "counter" }
+    { "haEntityId": "sensor.grid_consumption_total", "name": "Grid consumption total", "domain": "grid", "unit": "kWh", "kind": "counter" },
+    { "haEntityId": "sensor.zonneplan_gas_price_daily", "name": "Gas price daily", "domain": "price", "unit": "EUR/m3", "kind": "gas_price" }
   ]
 }
 ```
 
 - `kind: "price"` writes to the `price` table (no entity registration needed);
 - `kind: "sample"` writes the last value per bucket to `measurement`;
-- `kind: "counter"` expects a cumulative reading and writes the difference per bucket to `energy_delta`. For devices, configure both the power entity (sample) and the energy entity (counter).
+- `kind: "counter"` expects a cumulative reading and writes the difference per bucket to `energy_delta`. For devices, configure both the power entity (sample) and the energy entity (counter);
+- `kind: "gas_price"` writes the value to the `gas_price` table, keyed by local calendar day (no entity registration needed). The first observation of a day wins; later changes on the same day are ignored, so an early price for the next day cannot corrupt the current day.
+
+Gas note: a gas consumption entity (for example a daily "consumption today" sensor with a midnight reset) is a normal `counter`. The `delta_kwh` column then holds cubic metres (m3); the unit in the entity configuration determines the interpretation, and sums must always be taken per entity.
 
 ## Starting and testing
 
@@ -54,11 +59,12 @@ npm test          # unit tests of the ingest logic (no HA or database needed)
 npm start         # start the worker (Ctrl-C shuts it down cleanly)
 ```
 
-## Behavior and limitations (version 0.1)
+## Behavior and limitations
 
 - After a restart, the first bucket of every counter is a baseline: no delta is written because the previous reading is unknown. Measurement samples are still recorded.
 - Buckets without measurements get no row; gaps are visible as missing intervals (gapfill can be applied in queries).
 - Every bucket is written at most once; repeats (restart, reconnect) are idempotent thanks to the unique indexes in the database.
+- The gas price uses the time zone from `EMS_TIMEZONE` (default Europe/Amsterdam) to determine the calendar day, independent of the server clock.
 - On connection loss, the worker reconnects with increasing intervals and subscribes again.
 - For now, run the worker in a tmux session or under systemd; containerization will follow in a later phase.
 
@@ -70,7 +76,7 @@ npm start         # start the worker (Ctrl-C shuts it down cleanly)
 | src/engine.mjs | pure sampling and delta logic (fully tested) |
 | src/ha-client.mjs | WebSocket client with authentication and reconnect |
 | src/db.mjs | writes to TimescaleDB (idempotent) |
-| src/buckets.mjs | time intervals (5 minutes, hour) |
+| src/buckets.mjs | time intervals (5 minutes, hour, local day) |
 | src/list-entities.mjs | helper script to look up entity ids |
 | test/engine.test.mjs | unit tests (node --test) |
 

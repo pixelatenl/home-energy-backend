@@ -1,4 +1,4 @@
--- Home energy management system: initial database migration (revision 2)
+-- Home energy management system: initial database migration (revision 3)
 -- PostgreSQL 16 + TimescaleDB. Runs automatically on first container start
 -- via docker-entrypoint-initdb.d.
 --
@@ -7,6 +7,10 @@
 --    only sum() over energy_delta is meaningful.
 --  * timestamps are rounded to 5-minute buckets by the ingest worker;
 --    the unique index therefore makes duplicates predictable and idempotent.
+--
+-- Revision 3 (gas phase): adds the gas_price table (one row per local day).
+-- For an already deployed database run deploy/migrations/001_gas_price.sql
+-- once instead; the statements are idempotent.
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
@@ -15,9 +19,9 @@ CREATE TABLE IF NOT EXISTS entity (
     id            SMALLSERIAL PRIMARY KEY,
     ha_entity_id  TEXT NOT NULL UNIQUE,
     name          TEXT NOT NULL,
-    domain        TEXT NOT NULL,          -- grid | pv | battery | plug | weather | price | heat
+    domain        TEXT NOT NULL,          -- grid | pv | battery | plug | weather | price | heat | gas | appliance
     device_class  TEXT,
-    unit          TEXT,                   -- kW | kWh | W | EUR/kWh | %
+    unit          TEXT,                   -- kW | kWh | W | EUR/kWh | % | m3
     is_counter    BOOLEAN NOT NULL DEFAULT FALSE,  -- cumulative kWh meter: worker derives deltas
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -48,6 +52,8 @@ SELECT add_compression_policy('measurement', INTERVAL '7 days',
 --    Written by the ingest worker: delta = last reading in bucket
 --    minus last reading in the previous bucket. A meter reset (reading
 --    drops) is detected and yields delta = 0.
+--    For gas entities the delta_kwh column holds cubic metres (m3);
+--    the unit in the entity table determines the interpretation.
 CREATE TABLE IF NOT EXISTS energy_delta (
     entity_id  SMALLINT NOT NULL REFERENCES entity(id),
     ts         TIMESTAMPTZ NOT NULL,      -- bucket start (5 min)
@@ -81,6 +87,16 @@ CREATE TABLE IF NOT EXISTS price (
 SELECT create_hypertable('price', 'ts',
     chunk_time_interval => INTERVAL '1 month',
     if_not_exists => TRUE);
+
+-- 4b. Fact: daily gas price (Zonneplan publishes one gas price per day)
+--     Plain table, no hypertable: roughly 365 rows per year, kept forever.
+--     day is the local calendar day (Europe/Amsterdam), written by the
+--     ingest worker with the "first observation of the day wins" rule.
+CREATE TABLE IF NOT EXISTS gas_price (
+    day              DATE PRIMARY KEY,
+    price_eur_per_m3 DOUBLE PRECISION NOT NULL, -- EUR per m3 including VAT and levies
+    source           TEXT NOT NULL DEFAULT 'zonneplan'
+);
 
 -- 5. Continuous aggregates
 -- 5a. Power: hourly avg/max/min over measurement samples
@@ -145,9 +161,10 @@ SELECT add_retention_policy('measurement_hourly', INTERVAL '5 years',
     if_not_exists => TRUE);
 SELECT add_retention_policy('energy_hourly', INTERVAL '5 years',
     if_not_exists => TRUE);
--- energy_daily and price: kept forever (no retention policy)
+-- energy_daily, price and gas_price: kept forever (no retention policy)
 
 -- 7. Verification after the first ingest run (example)
 -- SELECT e.name, d.bucket, d.kwh
 -- FROM energy_daily d JOIN entity e ON e.id = d.entity_id
 -- ORDER BY d.bucket DESC LIMIT 10;
+-- SELECT * FROM gas_price ORDER BY day DESC LIMIT 5;

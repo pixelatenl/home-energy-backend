@@ -1,7 +1,8 @@
 // Ingest worker for the Energy Management System.
 // Subscribes to state changes in Home Assistant, samples into 5-minute
-// buckets and writes measurement samples, energy deltas and hourly prices
-// to TimescaleDB. See deploy/README.md and docs/database-design.md.
+// buckets and writes measurement samples, energy deltas, hourly electricity
+// prices and the daily gas price to TimescaleDB. See deploy/README.md and
+// docs/database-design.md.
 //
 // Requirements: Node.js >= 22, a running TimescaleDB stack (deploy/) and a
 // long-lived access token from Home Assistant.
@@ -28,12 +29,16 @@ if (!HA_TOKEN) {
   process.exit(1);
 }
 
+// Local time zone for daily facts (kind "gas_price"): the gas day price
+// belongs to the local calendar day, independent of the server clock.
+const EMS_TIMEZONE = process.env.EMS_TIMEZONE ?? "Europe/Amsterdam";
+
 // 2. Set up the engine and the database writer.
 const writer = new DbWriter(entities);
 await writer.init();
 log("Entities registered in the database:", entities.map((e) => e.haEntityId).join(", "));
 
-const engine = new IngestEngine(writer);
+const engine = new IngestEngine(writer, { timeZone: EMS_TIMEZONE });
 engine.registerEntities(entities);
 
 // 3. Translate incoming Home Assistant states into engine calls.

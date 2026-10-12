@@ -35,7 +35,7 @@ Important: never expose the database port to the internet; restrict access to th
 
 ## 3. Data model
 
-Principle: measurement samples and energy deltas are stored as separate facts, plus a dimension table for entities and a separate table for dynamic tariffs. Aggregations (hour, day) are computed by TimescaleDB itself via continuous aggregates, so the dashboard gets fast queries without the backend having to aggregate.
+Principle: measurement samples and energy deltas are stored as separate facts, plus a dimension table for entities and separate tables for dynamic tariffs. Aggregations (hour, day) are computed by TimescaleDB itself via continuous aggregates, so the dashboard gets fast queries without the backend having to aggregate.
 
 ### 3.1 Dimension: entities
 
@@ -44,10 +44,10 @@ CREATE TABLE entity (
     id            SMALLSERIAL PRIMARY KEY,
     ha_entity_id  TEXT NOT NULL UNIQUE,   -- e.g. sensor.p1_active_power
     name          TEXT NOT NULL,           -- e.g. "House grid consumption"
-    domain        TEXT NOT NULL,           -- grid, pv, battery, plug, weather, price, heat
+    domain        TEXT NOT NULL,           -- grid, pv, battery, plug, weather, price, heat, gas, appliance
     device_class  TEXT,
-    unit          TEXT,                    -- kW, kWh, W, EUR/kWh, %
-    is_counter    BOOLEAN NOT NULL DEFAULT FALSE,  -- true for cumulative kWh meters (worker derives deltas)
+    unit          TEXT,                    -- kW, kWh, W, EUR/kWh, %, m3
+    is_counter    BOOLEAN NOT NULL DEFAULT FALSE,  -- true for cumulative meters (worker derives deltas)
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -57,6 +57,8 @@ CREATE TABLE entity (
 Measurement samples (power, SOC, percentages) and energy are different facts: over power values an average is meaningful, over energy only a sum. Cumulative kWh meters do not produce sums but meter readings. The ingest worker therefore computes a delta in kWh per 5-minute interval and writes it to energy_delta; sum(delta_kwh) is then correct per hour, day and month. Meter resets (reading drops) are detected and yield delta 0.
 
 All timestamps are rounded to the 5-minute bucket start, so the unique index (entity_id, ts) makes duplicates predictable and writes idempotent.
+
+Gas entities use the same pipeline: a daily "gas consumption today" sensor with a midnight reset is a counter, its deltas land in energy_delta, and the continuous aggregates sum them like any other entity. For these entities the delta_kwh column holds cubic metres (m3); the unit in the entity table determines the interpretation, and sums must always be taken per entity, never mixed across entities.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS timescaledb;
@@ -70,7 +72,7 @@ CREATE TABLE measurement (          -- samples: kW, W, %, temperature
 SELECT create_hypertable('measurement', 'ts', chunk_time_interval => INTERVAL '1 day');
 CREATE UNIQUE INDEX ux_measurement_entity_ts ON measurement (entity_id, ts DESC);
 
-CREATE TABLE energy_delta (        -- energy per 5-minute interval
+CREATE TABLE energy_delta (        -- energy per 5-minute interval (kWh, or m3 for gas entities)
     entity_id  SMALLINT NOT NULL REFERENCES entity(id),
     ts         TIMESTAMPTZ NOT NULL,  -- bucket start (5 min)
     delta_kwh  DOUBLE PRECISION NOT NULL,
@@ -80,7 +82,7 @@ SELECT create_hypertable('energy_delta', 'ts', chunk_time_interval => INTERVAL '
 CREATE UNIQUE INDEX ux_energy_delta_entity_ts ON energy_delta (entity_id, ts DESC);
 ```
 
-### 3.3 Fact: dynamic hourly tariffs
+### 3.3 Fact: dynamic hourly electricity tariffs
 
 ```sql
 CREATE TABLE price (
@@ -94,7 +96,23 @@ CREATE TABLE price (
 SELECT create_hypertable('price', 'ts', chunk_time_interval => INTERVAL '1 month');
 ```
 
-### 3.4 Continuous aggregates
+### 3.4 Fact: daily gas price
+
+Zonneplan publishes one gas price per day, not per hour. The gas price is therefore stored in its own small table, keyed by local calendar day. It is deliberately separate from the price hypertable: the electricity price pipeline is validated and running, and the gas addition must not touch it.
+
+The ingest worker applies the "first observation of the day wins" rule: the first value seen after local midnight is written for that day, later changes on the same day are ignored. This keeps the day price correct even if the source publishes the next day's price in the evening. The local day is determined in the configured time zone (EMS_TIMEZONE, default Europe/Amsterdam), independent of the server clock.
+
+```sql
+CREATE TABLE gas_price (
+    day              DATE PRIMARY KEY,    -- local calendar day
+    price_eur_per_m3 DOUBLE PRECISION NOT NULL,  -- EUR per m3 (incl. VAT and levies)
+    source           TEXT NOT NULL DEFAULT 'zonneplan'
+);
+```
+
+Plain table, no hypertable: roughly 365 rows per year, kept forever. Cost of gas per day is exact: sum of gas deltas for the day times the day price.
+
+### 3.5 Continuous aggregates
 
 Sums are computed exclusively over energy_delta; over measurement samples only average, maximum and minimum. The full SQL with all policies is in deploy/initdb/init.sql.
 
@@ -130,14 +148,16 @@ WITH NO DATA;
 |---|---|---|---|
 | Zonneplan One (P1) | Grid consumption, grid feed-in (grid) | 5 min | kWh cumulative + kW |
 | Zonneplan One | Inverter yield (pv) | 5 min | kWh cumulative |
-| Zonneplan official | Current electricity price, sustainability score (price) | hourly | EUR/kWh |
+| Zonneplan official | Current electricity price (price) | hourly | EUR/kWh |
+| Zonneplan official | Gas consumption today (gas) | daily sensor, hourly updates from the P1 reader | m3 per day, midnight reset |
+| Zonneplan official | Gas price daily (price) | 1 day | EUR/m3 per day |
 | Anker SOLIX Max | Charge/discharge power, SOC (battery) | 5 min | kW, % |
 | Anker smart plugs | Power and energy per appliance (plug) | 5 min (Modbus provides 5 s, sampled to 5 min) | W, kWh |
 | Forecast.Solar | Production forecast (pv) | 1 hour | kWh forecast |
 | Evohome (later) | Heat demand per zone (heat) | 15 min | % |
 | Daikin (later) | Heat pump consumption (heat) | 5-15 min | kWh, temperature |
 
-Sampling strategy: 5 minutes for everything is more than sufficient for savings analysis and forecasts, and keeps storage small. The smart plugs deliver 5-second updates, but only a 5-minute sample is stored; raw 5-second data remains available in the recorder.
+Sampling strategy: 5 minutes for everything is more than sufficient for savings analysis and forecasts, and keeps storage small. The smart plugs deliver 5-second updates, but only a 5-minute sample is stored; raw 5-second data remains available in the recorder. Gas arrives with hourly resolution from the P1 reader at best; daily totals are sufficient for the hot water analysis.
 
 ## 5. Retention and backups
 
@@ -146,7 +166,7 @@ Sampling strategy: 5 minutes for everything is more than sufficient for savings 
 | measurement and energy_delta (raw, 5 min) | 1 year, then drop policy (aggregates remain) |
 | measurement_hourly and energy_hourly | 5 years |
 | energy_daily | kept forever |
-| price | kept forever (small, and needed for correct savings lookback) |
+| price and gas_price | kept forever (small, and needed for correct savings lookback) |
 
 ```sql
 SELECT add_retention_policy('measurement', INTERVAL '1 year');
@@ -155,15 +175,17 @@ SELECT add_retention_policy('measurement_hourly', INTERVAL '5 years');
 SELECT add_retention_policy('energy_hourly', INTERVAL '5 years');
 ```
 
-Backup policy: the entire database lives on a single SSD in a single container; without a backup a disk failure is fatal for the whole energy history. The db-backup container runs a nightly pg_dump with retention of 14 daily and 8 weekly dumps, stored outside the database volume. Because energy_daily and price are kept forever, the history can be restored from any dump.
+Backup policy: the entire database lives on a single SSD in a single container; without a backup a disk failure is fatal for the whole energy history. The db-backup container runs a nightly pg_dump with retention of 14 daily and 8 weekly dumps, stored outside the database volume. Because energy_daily, price and gas_price are kept forever, the history can be restored from any dump.
 
-Storage estimate: roughly 25 entities x 288 samples per day x 365 days is about 2.6 million rows per year; with compression that is well under 1 GB per year.
+Storage estimate: roughly 25 entities x 288 samples per day x 365 days is about 2.6 million rows per year; with compression that is well under 1 GB per year. The gas_price table adds roughly 365 rows per year.
 
 ## 6. Incorporated points of attention
 
 - Recorder retention (roughly 10 days for states) is the weak spot; the solution is temporarily raising purge_keep_days and running the ingest worker early, so the first backend run can backfill up to about 40 days.
 - Hourly tariffs arrive automatically from the Zonneplan integration; a price is never entered manually.
-- Monthly entities of the official Zonneplan integration are delayed and are ignored for the database; only the direct meters and the hourly price entity are ingested.
+- The gas price belongs to the local calendar day (Europe/Amsterdam), not to the UTC day; the worker decides the day via EMS_TIMEZONE, and the first observation of a day wins so early pre-publication cannot corrupt the day price.
+- Monthly entities of the official Zonneplan integration are delayed and are ignored for the database; only the direct meters and the price entities are ingested.
+- Like all "consumption today" sensors, the gas sensor resets at local midnight; the first interval of each day therefore has no delta (baseline). With hourly gas updates this means the 00:00 to 01:00 hour is structurally missing from the daily total; quantify this in the validation against the Zonneplan app.
 - The database runs on the same server as Home Assistant; Docker network, no external access. Any external access via Tailscale then also applies to the database.
 
 ## 7. Database phase roadmap
@@ -176,3 +198,5 @@ Storage estimate: roughly 25 entities x 288 samples per day x 365 days is about 
 6. Check the continuous aggregates: energy_hourly and energy_daily are filling.
 7. Verification: compare a daily total from energy_daily with the Home Assistant Energy dashboard; the deviation should stay below roughly 1 percent.
 8. Only then build the backend phase (forecast model, savings logic) on this foundation.
+
+Migrations for already deployed databases live in deploy/migrations/ and are idempotent; run them once via psql inside the database container.

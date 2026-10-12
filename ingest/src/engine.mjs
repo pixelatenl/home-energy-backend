@@ -14,22 +14,31 @@
 //   written for it because the previous reading is unknown.
 // - prices (kind "price"): every change is written with the start of the hour
 //   as timestamp; a newer price for the same hour wins (upsert).
+// - daily gas price (kind "gas_price"): the first observation of a local
+//   calendar day (time zone from the options) is written for that day;
+//   later observations on the same day are ignored. This "first write of
+//   the day wins" rule keeps the day price correct even if the source
+//   publishes the next day's price in the evening.
 // - Each bucket is finalized at most once (the "closed" flag); late
 //   measurements for an already closed bucket are ignored.
 
-import { bucketOf, hourOf } from "./buckets.mjs";
+import { bucketOf, hourOf, dayOf } from "./buckets.mjs";
 
 export class IngestEngine {
   /**
    * @param {object} writer - interface: writeMeasurement(meta, tsMs, value),
-   *   writeEnergyDelta(meta, tsMs, deltaKwh), writePrice(meta, tsMs, priceEur)
+   *   writeEnergyDelta(meta, tsMs, deltaKwh), writePrice(meta, tsMs, priceEur),
+   *   writeGasPrice(meta, day, priceEur)
    * @param {object} [options]
    * @param {() => number} [options.now] - injectable clock for testing
+   * @param {string} [options.timeZone] - IANA time zone for daily facts
+   *   (kind "gas_price"); defaults to UTC in tests, Europe/Amsterdam in index.mjs
    */
   constructor(writer, options = {}) {
     this.writer = writer;
     this.now = options.now ?? (() => Date.now());
-    /** @type {Map<string, {cfg: object, currentBucket: number|null, valueInBucket: number|null, prevEnd: number|null, closed: boolean}>} */
+    this.timeZone = options.timeZone ?? "UTC";
+    /** @type {Map<string, {cfg: object, currentBucket: number|null, valueInBucket: number|null, prevEnd: number|null, closed: boolean, gasDay: string|null}>} */
     this.track = new Map();
   }
 
@@ -45,6 +54,7 @@ export class IngestEngine {
         valueInBucket: null,
         prevEnd: null,
         closed: false,
+        gasDay: null,
       });
     }
   }
@@ -57,6 +67,18 @@ export class IngestEngine {
 
     if (t.cfg.kind === "price") {
       this.writer.writePrice(t.cfg, hourOf(tsMs), value);
+      return;
+    }
+
+    if (t.cfg.kind === "gas_price") {
+      const day = dayOf(tsMs, this.timeZone);
+      if (day !== t.gasDay) {
+        // First observation of this local day: write it and lock the day.
+        // Later observations (for example an early price for the next day)
+        // are ignored until the calendar day changes.
+        this.writer.writeGasPrice(t.cfg, day, value);
+        t.gasDay = day;
+      }
       return;
     }
 
@@ -91,7 +113,7 @@ export class IngestEngine {
   tick() {
     const nowBucket = bucketOf(this.now());
     for (const t of this.track.values()) {
-      if (t.cfg.kind === "price") continue;
+      if (t.cfg.kind === "price" || t.cfg.kind === "gas_price") continue;
       if (!t.closed && t.valueInBucket !== null && nowBucket > t.currentBucket) {
         this.finalizeBucket(t);
       }

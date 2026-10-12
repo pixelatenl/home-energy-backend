@@ -4,26 +4,32 @@
 // Timestamps are milliseconds since epoch. Bucket size is 5 minutes.
 // The tests use epoch 0 (Thursday 00:00 UTC) as their base;
 // bucketOf(0) = 0, so t=0, t=100000 and so on fall in the same first bucket.
+// Gas price tests use ISO strings with explicit offsets so that the local
+// day boundary (Europe/Amsterdam) is tested without depending on the
+// time zone of the machine running the tests.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { IngestEngine } from "../src/engine.mjs";
+import { dayOf } from "../src/buckets.mjs";
 
 const BUCKET = 5 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
+const DAY = 24 * 60 * 60 * 1000;
 
 function makeWriter() {
-  const calls = { measurement: [], delta: [], price: [] };
+  const calls = { measurement: [], delta: [], price: [], gasPrice: [] };
   return {
     calls,
     writeMeasurement: (meta, ts, value) => calls.measurement.push({ meta, ts, value }),
     writeEnergyDelta: (meta, ts, delta) => calls.delta.push({ meta, ts, delta }),
     writePrice: (meta, ts, price) => calls.price.push({ meta, ts, price }),
+    writeGasPrice: (meta, day, price) => calls.gasPrice.push({ meta, day, price }),
   };
 }
 
-function makeEngine(entities, writer, now = () => 0) {
-  const engine = new IngestEngine(writer, { now });
+function makeEngine(entities, writer, now = () => 0, options = {}) {
+  const engine = new IngestEngine(writer, { now, ...options });
   engine.registerEntities(entities);
   return engine;
 }
@@ -48,6 +54,13 @@ const priceEntity = {
   domain: "price",
   unit: "EUR/kWh",
   kind: "price",
+};
+const gasPriceEntity = {
+  haEntityId: "sensor.gas_price_daily",
+  name: "Gas price daily",
+  domain: "price",
+  unit: "EUR/m3",
+  kind: "gas_price",
 };
 
 test("sample: the last value of a bucket is only written when the bucket closes", () => {
@@ -99,6 +112,43 @@ test("price: every change is written at the start of the hour", () => {
     { meta: priceEntity, ts: 0, price: 0.21 },
     { meta: priceEntity, ts: HOUR, price: 0.19 },
   ], "the timestamp is the start of the hour of the observation");
+});
+
+test("gas_price: the first observation of a local day wins; later changes that day are ignored", () => {
+  const w = makeWriter();
+  const e = makeEngine([gasPriceEntity], w, () => 0, { timeZone: "UTC" });
+  e.onState("sensor.gas_price_daily", 1.7589, 0); // 1970-01-01 00:00 UTC
+  e.onState("sensor.gas_price_daily", 1.90, 12 * HOUR); // same day, corrected value: ignored
+  assert.deepEqual(w.calls.gasPrice, [
+    { meta: gasPriceEntity, day: "1970-01-01", price: 1.7589 },
+  ], "only the first observation of the day is written");
+  e.onState("sensor.gas_price_daily", 1.90, DAY); // next day
+  assert.deepEqual(w.calls.gasPrice[1], { meta: gasPriceEntity, day: "1970-01-02", price: 1.90 },
+    "the first observation of the new day is written with the new value");
+});
+
+test("gas_price: an early next-day price in the evening does not corrupt the current day", () => {
+  const w = makeWriter();
+  const e = makeEngine([gasPriceEntity], w, () => 0, { timeZone: "Europe/Amsterdam" });
+  const t = (iso) => Date.parse(iso);
+  e.onState("sensor.gas_price_daily", 1.7589, t("2026-10-12T22:00:00+02:00")); // 22:00 local
+  e.onState("sensor.gas_price_daily", 1.80, t("2026-10-12T23:00:00+02:00")); // 23:00 local: pre-published
+  assert.deepEqual(w.calls.gasPrice, [
+    { meta: gasPriceEntity, day: "2026-10-12", price: 1.7589 },
+  ], "the late evening change is ignored for 12 October");
+  e.onState("sensor.gas_price_daily", 1.80, t("2026-10-13T00:05:00+02:00")); // 00:05 local: new day
+  assert.deepEqual(w.calls.gasPrice[1], { meta: gasPriceEntity, day: "2026-10-13", price: 1.80 },
+    "the next morning the new day gets the price that was pre-published");
+});
+
+test("dayOf: the local day boundary follows the configured time zone", () => {
+  const t = (iso) => Date.parse(iso);
+  assert.equal(dayOf(t("2026-10-12T23:30:00Z"), "Europe/Amsterdam"), "2026-10-13",
+    "23:30 UTC is 01:30 on 13 October in Amsterdam (summer time)");
+  assert.equal(dayOf(t("2026-10-12T23:30:00Z"), "UTC"), "2026-10-12",
+    "in UTC the same moment is still 12 October");
+  assert.equal(dayOf(t("2026-12-31T23:30:00Z"), "Europe/Amsterdam"), "2027-01-01",
+    "the year rolls over correctly at the local day boundary");
 });
 
 test("tick closes a silent bucket exactly once", () => {

@@ -6,6 +6,20 @@
       "domain": "price",
       "unit": "EUR/kWh",
       "kind": "price"
+    },
+    {
+      "haEntityId": "sensor.zonneplan_gas_consumption_today",
+      "name": "Gas consumption today",
+      "domain": "gas",
+      "unit": "m3",
+      "kind": "counter"
+    },
+    {
+      "haEntityId": "sensor.zonneplan_gas_price_daily",
+      "name": "Gas price daily",
+      "domain": "price",
+      "unit": "EUR/m3",
+      "kind": "gas_price"
     }
   ]
 }

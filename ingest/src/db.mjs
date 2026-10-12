@@ -6,7 +6,12 @@
 // - entities are registered at startup (upsert on ha_entity_id);
 // - measurement and energy_delta are written idempotently
 //   (ON CONFLICT DO NOTHING: an already written bucket remains unchanged);
-// - price is upserted: a newer price for the same hour wins.
+// - price is upserted: a newer price for the same hour wins;
+// - gas_price is upserted on day: the engine already applies the
+//   "first observation of the day wins" rule, the upsert only makes
+//   restarts idempotent (the same value is written again).
+// Note: for gas entities the energy_delta column delta_kwh holds cubic
+// metres (m3); the unit in the entity table determines the interpretation.
 
 import pg from "pg";
 
@@ -21,7 +26,7 @@ export class DbWriter {
 
   async init() {
     for (const e of this.entities) {
-      if (e.kind === "price") continue; // prices are not stored in the entity table
+      if (e.kind === "price" || e.kind === "gas_price") continue; // prices are not stored in the entity table
       const res = await this.pool.query(
         `INSERT INTO entity (ha_entity_id, name, domain, unit, is_counter)
          VALUES ($1, $2, $3, $4, $5)
@@ -73,6 +78,19 @@ export class DbWriter {
         [iso(tsMs), priceEur, meta.source ?? "zonneplan"]
       )
       .catch((e) => console.error("price write error:", e.message));
+  }
+
+  writeGasPrice(meta, day, priceEur) {
+    this.pool
+      .query(
+        `INSERT INTO gas_price (day, price_eur_per_m3, source)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (day) DO UPDATE
+           SET price_eur_per_m3 = EXCLUDED.price_eur_per_m3,
+               source = EXCLUDED.source`,
+        [day, priceEur, meta.source ?? "zonneplan"]
+      )
+      .catch((e) => console.error("gas_price write error:", e.message));
   }
 
   async close() {
