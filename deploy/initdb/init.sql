@@ -147,8 +147,8 @@ GROUP BY entity_id, bucket
 WITH NO DATA;
 
 SELECT add_continuous_aggregate_policy('energy_daily',
-    start_offset      => INTERVAL '7 days',
-    end_offset        => INTERVAL '1 day',
+    start_offset      => INTERVAL '3 days',
+    end_offset        => INTERVAL '1 hour',
     schedule_interval => INTERVAL '1 hour',
     if_not_exists     => TRUE);
 
