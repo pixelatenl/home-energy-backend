@@ -1,4 +1,4 @@
--- Home energy management system: initial database migration (revision 3)
+-- Home energy management system: initial database migration (revision 4)
 -- PostgreSQL 16 + TimescaleDB. Runs automatically on first container start
 -- via docker-entrypoint-initdb.d.
 --
@@ -9,8 +9,11 @@
 --    the unique index therefore makes duplicates predictable and idempotent.
 --
 -- Revision 3 (gas phase): adds the gas_price table (one row per local day).
--- For an already deployed database run deploy/migrations/001_gas_price.sql
--- once instead; the statements are idempotent.
+-- Revision 4: energy_daily buckets over local calendar days
+-- (Europe/Amsterdam) instead of UTC days; the refresh policy is unchanged.
+-- For an already deployed database run deploy/migrations/001_gas_price.sql and
+-- deploy/migrations/002_energy_daily_local_day.sql once instead; the
+-- statements are idempotent.
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
@@ -135,12 +138,14 @@ SELECT add_continuous_aggregate_policy('energy_hourly',
     schedule_interval => INTERVAL '30 minutes',
     if_not_exists     => TRUE);
 
--- 5c. Energy: daily totals (verification against the HA Energy dashboard)
+-- 5c. Energy: daily totals, one local calendar day per bucket
+--     (Europe/Amsterdam, matching gas_price.day); verification against the
+--     HA Energy dashboard.
 CREATE MATERIALIZED VIEW IF NOT EXISTS energy_daily
 WITH (timescaledb.continuous) AS
 SELECT
     entity_id,
-    time_bucket('1 day', ts) AS bucket,
+    time_bucket('1 day', ts, 'Europe/Amsterdam') AS bucket,
     sum(delta_kwh) AS kwh
 FROM energy_delta
 GROUP BY entity_id, bucket
