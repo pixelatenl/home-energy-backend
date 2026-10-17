@@ -151,6 +151,46 @@ test("dayOf: the local day boundary follows the configured time zone", () => {
     "the year rolls over correctly at the local day boundary");
 });
 
+test("dayOf: a local day is 25 hours long across the fall-back transition", () => {
+  // 25 October 2026: clocks go back from 03:00 CEST to 02:00 CET at 01:00Z.
+  // The local day then spans [2026-10-24 22:00Z, 2026-10-25 23:00Z).
+  // The same rule is implemented by the energy_daily aggregate
+  // (time_bucket('1 day', ts, 'Europe/Amsterdam'), migration 002).
+  const t = (iso) => Date.parse(iso);
+  const tz = "Europe/Amsterdam";
+  assert.equal(dayOf(t("2026-10-24T21:59:59Z"), tz), "2026-10-24",
+    "21:59:59Z is 23:59:59 local on 24 October: the last instant of the previous day");
+  assert.equal(dayOf(t("2026-10-24T22:00:00Z"), tz), "2026-10-25",
+    "local midnight of the 25-hour day is 22:00Z on the previous UTC evening");
+  assert.equal(dayOf(t("2026-10-25T00:59:59Z"), tz), "2026-10-25",
+    "02:59:59 CEST: the last instant before the clocks go back");
+  assert.equal(dayOf(t("2026-10-25T01:00:00Z"), tz), "2026-10-25",
+    "02:00:00 CET: the repeated local hour belongs to the same local day");
+  assert.equal(dayOf(t("2026-10-25T22:59:59Z"), tz), "2026-10-25",
+    "23:59:59 CET: the last instant of the 25-hour day");
+  assert.equal(dayOf(t("2026-10-25T23:00:00Z"), tz), "2026-10-26",
+    "23:00Z is local midnight of 26 October (winter offset UTC+1)");
+});
+
+test("dayOf: a local day is 23 hours long across the spring-forward transition", () => {
+  // 29 March 2026: clocks jump from 02:00 CET to 03:00 CEST at 01:00Z.
+  // The local day then spans [2026-03-28 23:00Z, 2026-03-29 22:00Z).
+  const t = (iso) => Date.parse(iso);
+  const tz = "Europe/Amsterdam";
+  assert.equal(dayOf(t("2026-03-28T22:59:59Z"), tz), "2026-03-28",
+    "22:59:59Z is 23:59:59 local on 28 March: the last instant of the previous day");
+  assert.equal(dayOf(t("2026-03-28T23:00:00Z"), tz), "2026-03-29",
+    "local midnight of the 23-hour day is 23:00Z on the previous UTC evening");
+  assert.equal(dayOf(t("2026-03-29T00:59:59Z"), tz), "2026-03-29",
+    "01:59:59 CET: the last instant before the jump to 03:00");
+  assert.equal(dayOf(t("2026-03-29T01:00:00Z"), tz), "2026-03-29",
+    "03:00:00 CEST: the skipped local hour has no instants, so nothing is lost");
+  assert.equal(dayOf(t("2026-03-29T21:59:59Z"), tz), "2026-03-29",
+    "23:59:59 CEST: the last instant of the 23-hour day");
+  assert.equal(dayOf(t("2026-03-29T22:00:00Z"), tz), "2026-03-30",
+    "22:00Z is local midnight of 30 March (summer offset UTC+2)");
+});
+
 test("tick closes a silent bucket exactly once", () => {
   const w = makeWriter();
   let clock = 0;

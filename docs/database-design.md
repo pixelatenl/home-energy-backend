@@ -116,6 +116,8 @@ Plain table, no hypertable: roughly 365 rows per year, kept forever. Cost of gas
 
 Sums are computed exclusively over energy_delta; over measurement samples only average, maximum and minimum. The full SQL with all policies is in deploy/initdb/init.sql.
 
+Daily-alignment rule: `energy_daily` buckets over local calendar days (Europe/Amsterdam), not UTC days. The timezone-aware `time_bucket('1 day', ts, 'Europe/Amsterdam')` makes every bucket span exactly one local day, so the daily totals line up with the Home Assistant Energy dashboard and with `gas_price.day`. Bucket starts are local midnight expressed in UTC (22:00Z in summer, 23:00Z in winter). At DST transitions a local day is 23 or 25 hours long and the bucket follows that actual interval; the repeated local hour at fall-back consists of distinct UTC instants, and because `ts` is a timestamptz nothing is counted twice. The refresh policy (start_offset 3 days, end_offset 1 hour, schedule_interval 1 hour, materialized_only) always covers the most recent complete local day, including the 25-hour day and the one-hour shift of the bucket boundary at a transition. Already deployed databases get this definition from deploy/migrations/002_energy_daily_local_day.sql, which drops and rebuilds the aggregate from the raw history. The hourly aggregates stay UTC-aligned: the Amsterdam offset is always a whole number of hours, so UTC hour buckets coincide with local hours.
+
 ```sql
 -- Power: hourly avg/max/min
 CREATE MATERIALIZED VIEW measurement_hourly
@@ -134,9 +136,11 @@ FROM energy_delta
 GROUP BY entity_id, bucket
 WITH NO DATA;
 
+-- Daily sums over the deltas: one local calendar day per bucket
 CREATE MATERIALIZED VIEW energy_daily
 WITH (timescaledb.continuous) AS
-SELECT entity_id, time_bucket('1 day', ts) AS bucket, sum(delta_kwh) AS kwh
+SELECT entity_id, time_bucket('1 day', ts, 'Europe/Amsterdam') AS bucket,
+       sum(delta_kwh) AS kwh
 FROM energy_delta
 GROUP BY entity_id, bucket
 WITH NO DATA;
