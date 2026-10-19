@@ -65,8 +65,8 @@ npm start         # start the worker (Ctrl-C shuts it down cleanly)
 - Buckets without measurements get no row; gaps are visible as missing intervals (gapfill can be applied in queries).
 - Every bucket is written at most once; repeats (restart, reconnect) are idempotent thanks to the unique indexes in the database.
 - The gas price uses the time zone from `EMS_TIMEZONE` (default Europe/Amsterdam) to determine the calendar day, independent of the server clock.
-- On connection loss, the worker reconnects with increasing intervals and subscribes again.
-- For now, run the worker in a tmux session or under systemd; containerization will follow in a later phase.
+- On connection loss or a Home Assistant restart, the worker reconnects with increasing intervals and subscribes again. Before opening the WebSocket it probes Home Assistant's HTTP endpoint with a short timeout, so a container proxy that accepts TCP while Home Assistant is still booting cannot leave the client hanging in the connecting state; the WebSocket connection itself also carries a connect timeout with a safe abort.
+- A production deployment runs the worker as a systemd service (see below); containerization may follow in a later phase.
 
 ## Structure
 
@@ -74,12 +74,12 @@ npm start         # start the worker (Ctrl-C shuts it down cleanly)
 |---|---|
 | src/index.mjs | composition: configuration, connections, ticker |
 | src/engine.mjs | pure sampling and delta logic (fully tested) |
-| src/ha-client.mjs | WebSocket client with authentication and reconnect |
+| src/ha-client.mjs | WebSocket client with authentication, HTTP probe and reconnect |
 | src/db.mjs | writes to TimescaleDB (idempotent) |
 | src/buckets.mjs | time intervals (5 minutes, hour, local day) |
 | src/list-entities.mjs | helper script to look up entity ids |
 | test/engine.test.mjs | unit tests (node --test) |
-
+| ems-ingest.service | systemd unit for production (placeholder user) |
 
 ## Running as a systemd service
 
