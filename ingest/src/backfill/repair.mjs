@@ -52,7 +52,6 @@ export function createRowLoader(pool, ids) {
  * @param {number} [options.lookbackDays=7] - EMS_BACKFILL_LOOKBACK_DAYS
  * @param {number} [options.maxRowsPerRun=5000] - EMS_BACKFILL_MAX_ROWS_PER_RUN
  * @param {number} [options.maxGapBuckets=36] - EMS_BACKFILL_MAX_GAP_BUCKETS
- * @param {number} [options.maxAttempts=5] - EMS_BACKFILL_MAX_ATTEMPTS
  * @param {string} [options.timeZone] - EMS_TIMEZONE
  * @param {string} [options.source] - source label for repaired rows
  * @param {() => number} [options.now] - injectable clock
@@ -71,7 +70,6 @@ export async function runBackfill(options = {}) {
     lookbackDays = 7,
     maxRowsPerRun = 5000,
     maxGapBuckets = 36,
-    maxAttempts = 5,
     timeZone = "Europe/Amsterdam",
     source = "backfill-ha-history",
     now = () => Date.now(),
@@ -93,7 +91,7 @@ export async function runBackfill(options = {}) {
 
   const results = [];
   for (const cfg of candidates) {
-    results.push(await repairEntity(cfg, { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, maxGapBuckets, maxAttempts, dryRun }));
+    results.push(await repairEntity(cfg, { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, maxGapBuckets, dryRun }));
   }
   return { fromMs, toMs, results };
 }
@@ -126,29 +124,16 @@ async function repairEntity(cfg, c) {
   res.rangeStartMs = Math.min(...det.repairable.map((g) => g.startMs));
   res.rangeEndMs = Math.max(...det.repairable.map((g) => g.endMs));
 
-  // Permanent registry: skip covered gaps; promote repeatedly failing ones.
+  // Permanent registry: skip gaps inside ranges already marked permanent.
+  // Source-down is never permanent (docs/backfill-design.md, rule 8): a
+  // source that is merely down is a retry case, and every run retries it
+  // naturally. Nothing in this path writes permanent rows.
   const actionable = [];
   let permanent = 0;
   for (const g of det.repairable) {
     if (await c.log.isPermanent(cfg.haEntityId, cfg.kind, g.startMs, g.endMs)) {
       permanent += 1;
       continue;
-    }
-    if (c.maxAttempts > 0) {
-      const attempts = await c.log.countSourceDownAttempts(cfg.haEntityId, cfg.kind, g.startMs, g.endMs);
-      if (attempts >= c.maxAttempts) {
-        if (!c.dryRun) {
-          await c.log.markPermanent({
-            haEntityId: cfg.haEntityId,
-            kind: cfg.kind,
-            rangeStartMs: g.startMs,
-            rangeEndMs: g.endMs,
-            detail: `${attempts} source-down attempts, range given up`,
-          });
-        }
-        permanent += 1;
-        continue;
-      }
     }
     actionable.push(g);
   }

@@ -77,7 +77,6 @@ class FakeLog {
   constructor() {
     this.rows = [];
     this.permanent = [];
-    this.sourceDownAttempts = 0;
   }
   async insert(entry) {
     this.rows.push(entry);
@@ -87,9 +86,6 @@ class FakeLog {
   }
   async isPermanent() {
     return false;
-  }
-  async countSourceDownAttempts() {
-    return this.sourceDownAttempts;
   }
 }
 

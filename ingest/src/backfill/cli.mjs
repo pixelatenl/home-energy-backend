@@ -13,8 +13,7 @@
 // configuration, loaded exactly like src/index.mjs loads it), secrets and
 // tuning from the environment (the same ingest/.env as the worker):
 // HA_WS_URL, HA_TOKEN, PG*, EMS_TIMEZONE, EMS_BACKFILL_LOOKBACK_DAYS,
-// EMS_BACKFILL_MAX_ROWS_PER_RUN, EMS_BACKFILL_MAX_GAP_BUCKETS,
-// EMS_BACKFILL_MAX_ATTEMPTS. No new env files.
+// EMS_BACKFILL_MAX_ROWS_PER_RUN, EMS_BACKFILL_MAX_GAP_BUCKETS. No new env files.
 
 import { readFileSync } from "node:fs";
 import pg from "pg";
@@ -165,7 +164,6 @@ async function commandRepair(entities, args) {
       lookbackDays: Number(process.env.EMS_BACKFILL_LOOKBACK_DAYS ?? 7) || 7,
       maxRowsPerRun: Number(process.env.EMS_BACKFILL_MAX_ROWS_PER_RUN ?? 5000) || 5000,
       maxGapBuckets: Number(process.env.EMS_BACKFILL_MAX_GAP_BUCKETS ?? 36) || 36,
-      maxAttempts: Number(process.env.EMS_BACKFILL_MAX_ATTEMPTS ?? 5) || 5,
       timeZone: process.env.EMS_TIMEZONE ?? "Europe/Amsterdam",
       sinceMs,
       loadRows: createRowLoader(pool, dbWriter.ids),

@@ -68,11 +68,18 @@ again, without ever touching rows that already exist.
    With only one configured entity corroboration is impossible; the run then
    reports `source-down` (conservative: retry) rather than inventing
    confidence.
-8. **Permanent ranges.** A gap range that has failed
-   EMS_BACKFILL_MAX_ATTEMPTS (default 5) source-down attempts is marked
-   permanent in `backfill_log` (outcome `permanent`) and is skipped by later
-   runs, so futile retries do not repeat forever. `isPermanent` lookups
-   cover a gap only when a marked permanent range fully contains it.
+8. **Permanent ranges.** Source-down is never permanent: a source that is
+   merely down is a retry case, not an unrecoverable one, and every run
+   retries it naturally. The retry cost is bounded by design: the lookback
+   window (default 7 days) bounds how long any range is re-scanned, and the
+   per-run row cap bounds the hourly work. Permanent registration happens
+   only when a source is confirmed unable to cover a range (older than
+   recorder retention, or a source window that provably starts after the
+   gap), which the next build block wires. A gap range covered by a row
+   previously marked permanent in `backfill_log` (outcome `permanent`) is
+   skipped by later runs; `isPermanent` lookups cover a gap only when a
+   marked permanent range fully contains it. Nothing in the sample/counter
+   repair path writes permanent rows in this build block.
 9. **Worker untouched.** The running worker (src/index.mjs) is not modified
    and does not import the backfill modules. The backfill runs as a CLI
    command (detect, repair, report), manually or from a timer/unit that a
@@ -128,7 +135,7 @@ how the mechanism is verified without touching a production database.
 | ingest/src/backfill/sources/ha-history.mjs | HA REST history client (`fetchEntityHistory`) and `haHttpBaseFromWsUrl`. Fail-soft: returns a typed `{error}` object, never throws past the plugin boundary. |
 | ingest/src/backfill/repair.mjs | orchestrator `runBackfill` plus `createRowLoader` (SQL row loader). Replay, corroboration, budget, outcomes. |
 | ingest/src/backfill/writer.mjs | `BackfillWriter`: engine-writer adapter that labels writes with the backfill source and tracks pending inserts. |
-| ingest/src/backfill/log.mjs | `createBackfillLog`: backfill_log inserts, permanent-range registry (mark permanent, is-permanent, source-down attempt counting, recent rows). |
+| ingest/src/backfill/log.mjs | `createBackfillLog`: backfill_log inserts, permanent-range registry (mark permanent, is-permanent), recent rows. |
 | ingest/src/backfill/cli.mjs | commands detect, repair (default), report; flags --kind, --entity, --since, --dry-run, --limit. |
 | ingest/src/db.mjs | DbWriter with the additive `source` parameter (default `ingest`); write methods return their insert count. |
 | ingest/scripts/verify-backfill.mjs | manual verification script with fake writer, fake fetch and fake log (no database, no Home Assistant). |
@@ -189,8 +196,9 @@ For each configured entity of kind `sample` or `counter`:
 
 1. Load the existing rows from the window (measurement for samples,
    energy_delta for counters) and run `detectBucketGaps`.
-2. Drop gaps fully inside permanent ranges; count source-down attempts per
-   gap and mark gaps permanent after EMS_BACKFILL_MAX_ATTEMPTS.
+2. Drop gaps fully inside permanent ranges. Source-down is never permanent:
+   a source-down outcome writes its log row and moves on; the next run
+   retries the gap naturally (nothing here counts attempts).
 3. For each remaining gap, fetch the HA history for
    [startMs - 1 bucket, endMs + 1 bucket). The one bucket of left padding
    gives the engine the reading before the gap (the baseline rule then
@@ -284,7 +292,6 @@ Secrets and connection details come from the existing ingest/.env
 | EMS_BACKFILL_LOOKBACK_DAYS | 7 | detection window in days (before now) |
 | EMS_BACKFILL_MAX_ROWS_PER_RUN | 5000 | maximum replayed states per repair run |
 | EMS_BACKFILL_MAX_GAP_BUCKETS | 36 | maximum span in buckets of a repairable gap |
-| EMS_BACKFILL_MAX_ATTEMPTS | 5 | source-down attempts before a range is marked permanent |
 
 ```bash
 cd ingest

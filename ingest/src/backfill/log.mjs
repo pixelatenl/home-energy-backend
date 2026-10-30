@@ -4,8 +4,9 @@
 // Every repair run inserts exactly one row per processed entity and kind,
 // with the honest outcome. Rows with outcome 'permanent' double as the
 // permanent-range registry: repair runs skip gap ranges that such a row
-// fully covers, and count source-down rows to decide when a range is given
-// up on (marked permanent after EMS_BACKFILL_MAX_ATTEMPTS attempts).
+// fully covers. Source-down is never permanent: repair runs only read the
+// registry here; permanent registration happens when a source is confirmed
+// unable to cover a range, which the next build block wires.
 
 /**
  * Create the log store bound to a pg pool. The pool is owned by the caller.
@@ -66,20 +67,6 @@ export function createBackfillLog(pool) {
         [haEntityId, kind, iso(rangeStartMs), iso(rangeEndMs)]
       );
       return (res.rowCount ?? 0) > 0;
-    },
-
-    /**
-     * How many earlier source-down runs touched this range (overlapping)?
-     * Used to promote a repeatedly failing range to permanent.
-     */
-    async countSourceDownAttempts(haEntityId, kind, rangeStartMs, rangeEndMs) {
-      const res = await pool.query(
-        `SELECT count(*)::int AS n FROM backfill_log
-          WHERE ha_entity_id = $1 AND kind = $2 AND outcome = 'source-down'
-            AND range_start < $4 AND range_end > $3`,
-        [haEntityId, kind, iso(rangeStartMs), iso(rangeEndMs)]
-      );
-      return res.rows[0]?.n ?? 0;
     },
 
     /** The last limit log rows, newest first (CLI command "report"). */
