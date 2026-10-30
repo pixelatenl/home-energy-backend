@@ -188,7 +188,13 @@ function check(name, fn) {
     assert.equal(log.rows[0].outcome, "repaired");
     assert.equal(log.rows[0].kind, "counter");
     assert.equal(log.rows[0].haEntityId, counterEntity.haEntityId);
+    assert.equal(log.rows[0].runKind, "cli", "provenance: manual CLI run");
+    assert.equal(log.rows[0].source, "ha-history", "provenance: plugin source");
     assert.equal(log.rows[0].rowsWritten, 8);
+    assert.equal(log.rows[0].rowsMissing, 0, "fully repaired: nothing missing");
+    assert.equal(log.rows[0].detail.summary, "1 gap(s) repaired, 1 run(s) reportable but not repairable",
+      "structured detail: the repaired gap plus the trailing silence after the last worker row");
+    assert.equal(log.rows[0].detail.gaps_repaired, 1);
     assert.equal(log.rows[0].rangeStartMs, 10 * BUCKET, "range starts at the first missing bucket");
     assert.equal(log.rows[0].rangeEndMs, 18 * BUCKET, "range ends at the first existing bucket after the gap");
   });
@@ -216,9 +222,11 @@ function check(name, fn) {
   check("scenario 2: corroborated silence is outcome no-gap, nothing written", () => {
     assert.equal(run.results[0].outcome, "no-gap");
     assert.equal(run.results[0].rowsWritten, 0);
+    assert.equal(run.results[0].rowsMissing, 8, "the silent gap's buckets stay unwritten");
     assert.equal(db.deltas.size, existing.length);
     assert.equal(log.rows.length, 2, "one log row per configured entity");
     assert.equal(log.rows[0].outcome, "no-gap");
+    assert.equal(log.rows[0].rowsMissing, 8);
   });
 }
 
@@ -241,8 +249,10 @@ function check(name, fn) {
 
   check("scenario 3: recorder down is outcome source-down, nothing written", () => {
     assert.equal(run.results[0].outcome, "source-down");
+    assert.equal(run.results[0].rowsMissing, 8, "the gap's buckets stay unwritten");
     assert.equal(db.deltas.size, existing.length);
     assert.equal(log.rows[0].outcome, "source-down");
+    assert.equal(log.rows[0].rowsMissing, 8);
   });
 }
 
@@ -268,8 +278,13 @@ function check(name, fn) {
     // 4 states replayed: the left padding state is the baseline (no row),
     // so the replay writes buckets 10, 11 and (via the closing tick) 12.
     assert.equal(run.results[0].rowsWritten, 3);
+    // Honest bookkeeping: written + missing equals the detected missing buckets.
+    assert.equal(run.results[0].rowsMissing, 5);
+    assert.equal(run.results[0].rowsWritten + run.results[0].rowsMissing, 8);
     assert.equal(db.deltas.size, existing.length + 3, "only the budgeted rows were added");
-    assert.ok(/budget exhausted/.test(log.rows[0].detail), "the detail explains the budget stop");
+    assert.ok(/budget exhausted/.test(log.rows[0].detail.summary), "the summary explains the budget stop");
+    assert.equal(log.rows[0].rowsWritten + log.rows[0].rowsMissing, 8);
+    assert.equal(log.rows[0].detail.budget_exhausted_mid_gap, true);
   });
 }
 
@@ -293,6 +308,7 @@ function check(name, fn) {
   check("scenario 5: dry-run writes no rows and no log entries", () => {
     assert.equal(run.results[0].outcome, "repaired"); // would have repaired
     assert.equal(run.results[0].rowsWritten, 0);
+    assert.equal(run.results[0].rowsMissing, 8, "computed for the report, but not logged");
     assert.equal(run.results[0].statesReplayed, 10, "states would have been replayed");
     assert.equal(db.deltas.size, existing.length, "no data rows written");
     assert.equal(log.rows.length, 0, "no backfill_log rows written");

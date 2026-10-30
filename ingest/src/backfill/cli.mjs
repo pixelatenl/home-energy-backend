@@ -165,6 +165,9 @@ async function commandRepair(entities, args) {
       maxRowsPerRun: Number(process.env.EMS_BACKFILL_MAX_ROWS_PER_RUN ?? 5000) || 5000,
       maxGapBuckets: Number(process.env.EMS_BACKFILL_MAX_GAP_BUCKETS ?? 36) || 36,
       timeZone: process.env.EMS_TIMEZONE ?? "Europe/Amsterdam",
+      source: "backfill-ha-history", // row label in energy_delta
+      logSource: "ha-history", // plugin recorded in backfill_log.source
+      runKind: "cli", // backfill_log.run_kind; 'auto' arrives with the timer
       sinceMs,
       loadRows: createRowLoader(pool, dbWriter.ids),
       fetchHistory,
@@ -179,9 +182,10 @@ async function commandRepair(entities, args) {
     }
     for (const r of results) {
       console.log(
-        `  ${r.haEntityId} [${r.kind}]: ${r.outcome}, ${r.rowsWritten} row(s) written` +
+        `  ${r.haEntityId} [${r.kind}]: ${r.outcome}, ${r.rowsWritten} row(s) written, ` +
+          `${r.rowsMissing} missing bucket(s) not written` +
           (args.dryRun ? `, ${r.statesReplayed} state(s) replayable` : "") +
-          `; ${r.detail}`
+          `; ${r.detail?.summary ?? ""}`
       );
     }
   } finally {
@@ -200,9 +204,11 @@ async function commandReport(args) {
     }
     for (const r of rows) {
       const range = `${new Date(r.range_start).toISOString()} .. ${new Date(r.range_end).toISOString()}`;
+      const detail = r.detail && typeof r.detail === "object" ? (r.detail.summary ?? JSON.stringify(r.detail)) : r.detail;
       console.log(
-        `${r.id}  ${r.created_at.toISOString()}  ${r.ha_entity_id} [${r.kind}] ${r.outcome} ${r.rows_written} row(s)  ${range}` +
-          (r.detail ? `  (${r.detail})` : "")
+        `${r.id}  ${r.created_at.toISOString()}  ${r.ha_entity_id} [${r.kind}] ${r.run_kind}/${r.source} ` +
+          `${r.outcome} ${r.rows_written} row(s) written, ${r.rows_missing} missing  ${range}` +
+          (detail ? `  (${detail})` : "")
       );
     }
   } finally {

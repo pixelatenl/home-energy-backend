@@ -93,7 +93,7 @@ again, without ever touching rows that already exist.
 ## 3. Outcome taxonomy
 
 Every repair run writes exactly one `backfill_log` row per processed entity
-and kind, with one of five outcomes. Exit code of the CLI is 0 for all of
+and kind, with one of six outcomes. Exit code of the CLI is 0 for all of
 them; they describe data, not program failure.
 
 | Outcome | Meaning |
@@ -103,6 +103,7 @@ them; they describe data, not program failure.
 | `source-down` | The history fetch failed (typed error, Home Assistant unreachable) or returned no states while corroboration says the recorder was down. Retried on the next run. |
 | `permanent` | All repairable gaps are inside ranges previously marked permanent; nothing was attempted. |
 | `no-gap` | Nothing to repair: no repairable gaps detected (silence and slow cadence are not gaps), or every gap was corroborated entity silence (other entities do have states in the range). |
+| `attribution-suspect` | Report only, written by the class 2 catch-up detection of a later block: a gap whose energy cannot be attributed to buckets. No rows are written for it. |
 
 ## 4. Architecture
 
@@ -220,7 +221,12 @@ For each configured entity of kind `sample` or `counter`:
 7. Aggregate the per-gap results into the per-entity outcome (section 3),
    flush the writer, and insert one backfill_log row with the outcome, the
    union range of the entity's gaps (or the window when there were none),
-   the number of rows actually inserted and a human-readable detail.
+   the run provenance (run_kind, source) and honest bookkeeping:
+   rows_written (rows actually inserted) next to rows_missing (detected
+   missing buckets this run did not write: not-attempted or truncated gaps,
+   corroborated-silence buckets, source-down gaps; 0 on a fully repaired
+   gap), plus a structured detail (JSONB) with a human-readable summary
+   field and the counters.
 
 `--dry-run` performs detection and the history fetches but performs no
 writes at all: no replay, no backfill_log inserts, no permanent marking.
@@ -231,17 +237,25 @@ writes at all: no replay, no backfill_log inserts, no permanent marking.
 kind per run, small volume, kept forever as the audit trail of what was
 repaired and what was given up. `ha_entity_id` is stored as text because
 price and gas_price entities have no row in the entity dimension table.
+Provenance is part of every row: `run_kind` distinguishes timer runs
+(`auto`, a later build block) from manual CLI runs (`cli`), and `source`
+records which plugin supplied the rows (`ha-history` today;
+`zonneplan-forecast` and `zonneplan-history` arrive with the later plugins;
+`none` for registry-only rows).
 
 ```sql
 CREATE TABLE IF NOT EXISTS backfill_log (
     id            BIGSERIAL PRIMARY KEY,
     ha_entity_id  TEXT NOT NULL,           -- configured entity, also for kinds without an entity table row
     kind          TEXT NOT NULL,           -- sample | counter | price | gas_price
-    outcome       TEXT NOT NULL CHECK (outcome IN ('repaired', 'partial', 'source-down', 'permanent', 'no-gap')),
+    run_kind      TEXT NOT NULL,           -- auto (timer) | cli (manual)
+    source        TEXT NOT NULL,           -- ha-history | zonneplan-forecast | zonneplan-history | none
+    outcome       TEXT NOT NULL CHECK (outcome IN ('repaired', 'partial', 'source-down', 'permanent', 'no-gap', 'attribution-suspect')),
     range_start   TIMESTAMPTZ NOT NULL,    -- union of the entity's repairable gaps this run (window when none)
     range_end     TIMESTAMPTZ NOT NULL,
     rows_written  INTEGER NOT NULL DEFAULT 0,
-    detail        TEXT,
+    rows_missing  INTEGER NOT NULL DEFAULT 0, -- detected missing buckets this run did not write
+    detail        JSONB,                    -- structured audit: summary plus counters
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -272,7 +286,8 @@ These rules are invariant for every present and future backfill plugin:
    decide, and the conservative answer (source-down, retry) is preferred
    over declaring a repair that cannot be corroborated.
 6. Every repair attempt is auditable: one backfill_log row per entity and
-   kind per run, with the honest outcome, even when nothing was written.
+   kind per run, with the honest outcome and honest bookkeeping
+   (rows_written next to rows_missing), even when nothing was written.
 7. Bounded blast radius: capped rows per run, capped gap size per repair,
    capped lookback window; permanent ranges stop futile retries.
 8. A repair run is read-only with respect to live ingestion: it never
@@ -309,8 +324,8 @@ node scripts/verify-backfill.mjs                      # manual verification with
 Exit code 0 covers every data outcome including no-gap; non-zero is for
 program errors (missing config.json or HA_TOKEN, unreachable database).
 config.json is untracked deployment configuration (see config.example.json
-for the shape); the CLI refuses to start without it, and the unit tests use
-fixtures instead of config.json.
+for the shape); detect and repair refuse to start without it, report needs
+no config.json, and the unit tests use fixtures instead of config.json.
 
 ## 11. Verification
 

@@ -9,7 +9,9 @@
 //      written, with the backfill source label;
 //   4. corroborates an empty fetch against the other configured entities
 //      (entity silence vs recorder down);
-//   5. writes exactly one backfill_log row per entity/kind with the outcome.
+//   5. writes exactly one backfill_log row per entity/kind with the outcome
+//      and honest bookkeeping (rows_written next to rows_missing), carrying
+//      the run provenance (run_kind, source).
 //
 // Everything with a side effect is injected (row loader, history fetch,
 // db writer, log store), so unit tests and the verification script can run
@@ -53,7 +55,12 @@ export function createRowLoader(pool, ids) {
  * @param {number} [options.maxRowsPerRun=5000] - EMS_BACKFILL_MAX_ROWS_PER_RUN
  * @param {number} [options.maxGapBuckets=36] - EMS_BACKFILL_MAX_GAP_BUCKETS
  * @param {string} [options.timeZone] - EMS_TIMEZONE
- * @param {string} [options.source] - source label for repaired rows
+ * @param {string} [options.source] - source label written into repaired rows
+ *   (energy_delta.source; 'backfill-ha-history' for this path)
+ * @param {string} [options.logSource] - plugin recorded in backfill_log.source
+ *   ('ha-history' for this path; the later plugins add their values)
+ * @param {string} [options.runKind] - provenance in backfill_log.run_kind
+ *   ('cli' today; the hourly timer of the next block passes 'auto')
  * @param {() => number} [options.now] - injectable clock
  * @param {number|null} [options.sinceMs] - explicit window start (--since)
  * @param {Function} options.loadRows - async (cfg, fromMs, toMs) => number[]
@@ -72,6 +79,8 @@ export async function runBackfill(options = {}) {
     maxGapBuckets = 36,
     timeZone = "Europe/Amsterdam",
     source = "backfill-ha-history",
+    logSource = "ha-history",
+    runKind = "cli",
     now = () => Date.now(),
     sinceMs = null,
     loadRows,
@@ -91,7 +100,7 @@ export async function runBackfill(options = {}) {
 
   const results = [];
   for (const cfg of candidates) {
-    results.push(await repairEntity(cfg, { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, maxGapBuckets, dryRun }));
+    results.push(await repairEntity(cfg, { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, logSource, runKind, maxGapBuckets, dryRun }));
   }
   return { fromMs, toMs, results };
 }
@@ -101,21 +110,31 @@ async function repairEntity(cfg, c) {
   const rows = await c.loadRows(cfg, c.fromMs, c.toMs);
   const det = detectBucketGaps(rows, c.fromMs, c.toMs, { maxGapBuckets: c.maxGapBuckets });
 
+  // Honest bookkeeping: rows_written counts the rows really inserted;
+  // rows_missing counts the detected missing buckets this run did not write
+  // (not-attempted or truncated gaps, corroborated-silence buckets,
+  // source-down gaps). On a fully repaired gap the two add up to the
+  // detected missing buckets with rows_missing 0.
+  const totalMissing = det.repairable.reduce((a, g) => a + g.missingBuckets, 0);
+
   const res = {
     haEntityId: cfg.haEntityId,
     kind: cfg.kind,
+    runKind: c.runKind,
+    source: c.logSource,
     outcome: "no-gap",
     rowsWritten: 0,
+    rowsMissing: totalMissing,
     statesReplayed: 0,
     gapsRepairable: det.repairable.length,
     gapsReportable: det.reportable.length,
     rangeStartMs: c.fromMs,
     rangeEndMs: c.toMs,
-    detail: "",
+    detail: null,
   };
 
   if (det.repairable.length === 0) {
-    res.detail = describe(0, 0, 0, det.reportable.length);
+    res.detail = detailObject(0, 0, 0, 0, det.reportable.length, false, false);
     await finish(res, c);
     return res;
   }
@@ -139,7 +158,7 @@ async function repairEntity(cfg, c) {
   }
   if (actionable.length === 0) {
     res.outcome = "permanent";
-    res.detail = `${permanent} gap(s) in permanent range(s)`;
+    res.detail = detailObject(0, 0, 0, permanent, det.reportable.length, false, false);
     await finish(res, c);
     return res;
   }
@@ -195,6 +214,7 @@ async function repairEntity(cfg, c) {
   }
 
   res.rowsWritten = c.dryRun ? 0 : await bfWriter.flush();
+  res.rowsMissing = Math.max(0, totalMissing - res.rowsWritten);
 
   if (truncated || unattempted || (repaired > 0 && down > 0)) {
     res.outcome = "partial";
@@ -205,9 +225,7 @@ async function repairEntity(cfg, c) {
   } else {
     res.outcome = "no-gap"; // every gap was corroborated entity silence
   }
-  res.detail = describe(repaired, silent, down, det.reportable.length) +
-    (truncated ? "; row budget exhausted mid-gap" : "") +
-    (unattempted ? "; row budget exhausted, gap(s) not attempted" : "");
+  res.detail = detailObject(repaired, silent, down, permanent, det.reportable.length, truncated, unattempted);
   await finish(res, c);
   return res;
 }
@@ -234,20 +252,40 @@ async function finish(res, c) {
     await c.log.insert({
       haEntityId: res.haEntityId,
       kind: res.kind,
+      runKind: res.runKind,
+      source: res.source,
       outcome: res.outcome,
       rangeStartMs: res.rangeStartMs,
       rangeEndMs: res.rangeEndMs,
       rowsWritten: res.rowsWritten,
+      rowsMissing: res.rowsMissing,
       detail: res.detail,
     });
   }
 }
 
-function describe(repaired, silent, down, reportable) {
+/**
+ * Structured detail for backfill_log.detail (JSONB): a human-readable
+ * summary field plus the counters of the run.
+ */
+function detailObject(repaired, silent, down, permanent, reportable, truncated, unattempted) {
   const parts = [];
   if (repaired > 0) parts.push(`${repaired} gap(s) repaired`);
   if (silent > 0) parts.push(`${silent} silent (corroborated)`);
   if (down > 0) parts.push(`${down} source-down`);
+  if (permanent > 0) parts.push(`${permanent} gap(s) in permanent range(s)`);
   if (reportable > 0) parts.push(`${reportable} run(s) reportable but not repairable`);
-  return parts.length > 0 ? parts.join(", ") : "no gaps";
+  if (truncated) parts.push("row budget exhausted mid-gap");
+  if (unattempted) parts.push("row budget exhausted, gap(s) not attempted");
+  if (parts.length === 0) parts.push("no gaps");
+  return {
+    summary: parts.join(", "),
+    gaps_repaired: repaired,
+    gaps_silent: silent,
+    gaps_source_down: down,
+    gaps_permanent: permanent,
+    runs_reportable: reportable,
+    budget_exhausted_mid_gap: truncated,
+    budget_exhausted_not_attempted: unattempted,
+  };
 }

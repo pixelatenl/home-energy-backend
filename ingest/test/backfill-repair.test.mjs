@@ -87,6 +87,7 @@ test("source-down is never permanent: a typed fetch error across many runs stays
     assert.equal(results.length, 1);
     assert.equal(results[0].outcome, "source-down", `run ${run}: the gap stays a retry case`);
     assert.equal(results[0].rowsWritten, 0, `run ${run}: nothing is written while the source is down`);
+    assert.equal(results[0].rowsMissing, 8, `run ${run}: the gap's buckets stay unwritten`);
   }
 
   assert.equal(log.rows.length, RUNS, "every run writes its own log row");
@@ -94,7 +95,64 @@ test("source-down is never permanent: a typed fetch error across many runs stays
     log.rows.every((r) => r.outcome === "source-down"),
     "every logged outcome is source-down"
   );
+  assert.ok(log.rows.every((r) => r.rowsMissing === 8), "every log row books the 8 missing buckets");
   assert.equal(log.permanent.length, 0, "no permanent log row is ever written from retry counts");
   assert.equal(db.deltas.size, 0, "no data rows were written");
   assert.equal(fetchCalls, RUNS, "each run retried the fetch naturally");
+});
+
+/** Fake HA history: the counter reports every 5 minutes across the window. */
+function fullCounterHistory() {
+  const states = [];
+  for (let t = 0; t < WINDOW; t += BUCKET) {
+    states.push({
+      entity_id: counterEntity.haEntityId,
+      state: String(100 + (t / BUCKET) * 0.5),
+      last_updated_ts: (t + 1000) / 1000,
+    });
+  }
+  return states;
+}
+
+test("partial run under the row budget: rows_written + rows_missing equals the detected missing buckets", async () => {
+  const existing = existingRowsWithGap(); // 8 detected missing buckets (45-minute gap)
+  const db = new FakeDb();
+  const log = new FakeLog();
+
+  const { results } = await runBackfill({
+    entities: [counterEntity],
+    sinceMs: 0,
+    now: () => WINDOW,
+    maxRowsPerRun: 4, // cuts the replay mid-gap
+    loadRows: async () => existing,
+    fetchHistory: async (entityId, startMs, endMs) => ({
+      states: fullCounterHistory().filter(
+        (s) => s.last_updated_ts * 1000 >= startMs && s.last_updated_ts * 1000 < endMs
+      ),
+    }),
+    dbWriter: db,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.outcome, "partial");
+  // 4 states replayed: the left padding state is the baseline (no row),
+  // so the replay writes buckets 10, 11 and (via the closing tick) 12.
+  assert.equal(r.rowsWritten, 3);
+  assert.equal(r.rowsMissing, 5);
+  assert.equal(
+    r.rowsWritten + r.rowsMissing,
+    8,
+    "written + missing equals the detected missing buckets"
+  );
+  assert.equal(r.detail.budget_exhausted_mid_gap, true, "the structured detail carries the flag");
+  assert.equal(typeof r.detail.summary, "string");
+
+  const entry = log.rows[0];
+  assert.equal(entry.outcome, "partial");
+  assert.equal(entry.runKind, "cli", "provenance: manual CLI run");
+  assert.equal(entry.source, "ha-history", "provenance: plugin source");
+  assert.equal(entry.rowsWritten, 3);
+  assert.equal(entry.rowsMissing, 5);
+  assert.equal(entry.rowsWritten + entry.rowsMissing, 8, "the log row books honestly");
 });

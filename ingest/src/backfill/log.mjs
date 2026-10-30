@@ -2,11 +2,17 @@
 // (see docs/backfill-design.md, sections 3 and 8).
 //
 // Every repair run inserts exactly one row per processed entity and kind,
-// with the honest outcome. Rows with outcome 'permanent' double as the
-// permanent-range registry: repair runs skip gap ranges that such a row
-// fully covers. Source-down is never permanent: repair runs only read the
-// registry here; permanent registration happens when a source is confirmed
-// unable to cover a range, which the next build block wires.
+// with the honest outcome and honest bookkeeping: rows_written (rows really
+// inserted) next to rows_missing (detected missing buckets this run did not
+// write). Provenance is part of every row: run_kind (auto | cli) and source
+// (which plugin supplied the rows). detail is a JSONB object with a
+// human-readable summary field plus the counters.
+//
+// Rows with outcome 'permanent' double as the permanent-range registry:
+// repair runs skip gap ranges that such a row fully covers. Source-down is
+// never permanent: repair runs only read the registry here; permanent
+// registration happens when a source is confirmed unable to cover a range,
+// which the next build block wires.
 
 /**
  * Create the log store bound to a pg pool. The pool is owned by the caller.
@@ -18,37 +24,49 @@ export function createBackfillLog(pool) {
 
   return {
     /**
-     * Insert one run result. entry: {haEntityId, kind, outcome,
-     * rangeStartMs, rangeEndMs, rowsWritten, detail}.
+     * Insert one run result. entry: {haEntityId, kind, runKind, source,
+     * outcome, rangeStartMs, rangeEndMs, rowsWritten, rowsMissing, detail}.
+     * detail is a plain object (JSONB) or null.
      */
     async insert(entry) {
       await pool.query(
         `INSERT INTO backfill_log
-           (ha_entity_id, kind, outcome, range_start, range_end, rows_written, detail)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+           (ha_entity_id, kind, run_kind, source, outcome, range_start, range_end,
+            rows_written, rows_missing, detail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           entry.haEntityId,
           entry.kind,
+          entry.runKind ?? "cli",
+          entry.source ?? "none",
           entry.outcome,
           iso(entry.rangeStartMs),
           iso(entry.rangeEndMs),
           entry.rowsWritten ?? 0,
+          entry.rowsMissing ?? 0,
           entry.detail ?? null,
         ]
       );
     },
 
-    /** Mark a range permanent: no more repair attempts for gaps it covers. */
+    /**
+     * Mark a range permanent: no more repair attempts for gaps it covers.
+     * Carries the same provenance fields as insert.
+     */
     async markPermanent(entry) {
       await pool.query(
         `INSERT INTO backfill_log
-           (ha_entity_id, kind, outcome, range_start, range_end, rows_written, detail)
-         VALUES ($1, $2, 'permanent', $3, $4, 0, $5)`,
+           (ha_entity_id, kind, run_kind, source, outcome, range_start, range_end,
+            rows_written, rows_missing, detail)
+         VALUES ($1, $2, $3, $4, 'permanent', $5, $6, 0, $7, $8)`,
         [
           entry.haEntityId,
           entry.kind,
+          entry.runKind ?? "cli",
+          entry.source ?? "none",
           iso(entry.rangeStartMs),
           iso(entry.rangeEndMs),
+          entry.rowsMissing ?? 0,
           entry.detail ?? null,
         ]
       );
@@ -72,8 +90,8 @@ export function createBackfillLog(pool) {
     /** The last limit log rows, newest first (CLI command "report"). */
     async recent(limit = 20) {
       const res = await pool.query(
-        `SELECT id, ha_entity_id, kind, outcome, range_start, range_end,
-                rows_written, detail, created_at
+        `SELECT id, ha_entity_id, kind, run_kind, source, outcome, range_start, range_end,
+                rows_written, rows_missing, detail, created_at
          FROM backfill_log
          ORDER BY id DESC
          LIMIT $1`,
