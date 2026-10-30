@@ -87,6 +87,26 @@ export function createBackfillLog(pool) {
       return (res.rowCount ?? 0) > 0;
     },
 
+    /**
+     * Permanent ranges overlapping the given window (ascending), for
+     * detection: gaps inside them are excluded before repair. Overlap, not
+     * full cover: the caller decides per hour/day/bucket whether a range
+     * fully covers the item.
+     */
+    async permanentRanges(haEntityId, kind, fromMs, toMs) {
+      const res = await pool.query(
+        `SELECT range_start, range_end FROM backfill_log
+          WHERE ha_entity_id = $1 AND kind = $2 AND outcome = 'permanent'
+            AND range_start < $4 AND range_end > $3
+          ORDER BY range_start`,
+        [haEntityId, kind, iso(fromMs), iso(toMs)]
+      );
+      return res.rows.map((r) => ({
+        startMs: new Date(r.range_start).getTime(),
+        endMs: new Date(r.range_end).getTime(),
+      }));
+    },
+
     /** The last limit log rows, newest first (CLI command "report"). */
     async recent(limit = 20) {
       const res = await pool.query(

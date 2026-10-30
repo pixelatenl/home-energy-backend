@@ -1,0 +1,14 @@
+[Unit]
+Description=Home energy backfill repair (one run, started by the hourly timer)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust the user name and the paths to your setup (like ems-ingest.service).
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/home-energy-backend/ingest
+EnvironmentFile=/home/YOUR_USER/home-energy-backend/ingest/.env
+# --auto: run_kind auto in backfill_log, journal-friendly one-line summary
+# per entity, bounded blast radius (row cap and lookback window).
+ExecStart=/usr/bin/node src/backfill/cli.mjs repair --auto

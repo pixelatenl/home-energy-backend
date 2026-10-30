@@ -31,10 +31,10 @@ again, without ever touching rows that already exist.
    injected writer, per entity, so a repaired gap is byte-for-byte what the
    live worker would have written.
 2. **Additive labelling.** `energy_delta`, `price` and `gas_price` have a
-   `source` column. Rows written by the history backfill are labelled
-   `backfill-ha-history` (HA history plugin); the later price plugin will
-   label `zonneplan-backfill`. The labelling is additive: `DbWriter`
-   gained an optional `source` parameter (default `ingest`) on
+   `source` column. Rows written by the HA history plugin are labelled
+   `backfill-ha-history`; rows written by the Zonneplan price and gas price
+   plugins are labelled `zonneplan-backfill`. The labelling is additive:
+   `DbWriter` gained an optional `source` parameter (default `ingest`) on
    `writeEnergyDelta`, so worker behaviour is unchanged. The `measurement`
    table has no `source` column; backfilled samples are therefore
    indistinguishable from live ones in that table (still conflict-protected,
@@ -73,13 +73,17 @@ again, without ever touching rows that already exist.
    retries it naturally. The retry cost is bounded by design: the lookback
    window (default 7 days) bounds how long any range is re-scanned, and the
    per-run row cap bounds the hourly work. Permanent registration happens
-   only when a source is confirmed unable to cover a range (older than
-   recorder retention, or a source window that provably starts after the
-   gap), which the next build block wires. A gap range covered by a row
-   previously marked permanent in `backfill_log` (outcome `permanent`) is
-   skipped by later runs; `isPermanent` lookups cover a gap only when a
-   marked permanent range fully contains it. Nothing in the sample/counter
-   repair path writes permanent rows in this build block.
+   only when a source is confirmed unable to cover a range: uncovered price
+   hours and gas days older than the recorder retention window
+   (EMS_BACKFILL_RECORDER_RETENTION_DAYS, default 40, matching the
+   recorder's purge_keep_days), registered only when the fallback history
+   source was consulted and answered (a fetch error confirms nothing). A gap
+   range covered by a row previously marked permanent in `backfill_log`
+   (outcome `permanent`) is excluded by detection for price, gas_price and
+   bucket kinds (`permanentRanges` overlap lookups; a bucket gap is skipped
+   when a permanent range fully contains it). The sample/counter path never
+   writes permanent rows; the price and gas paths register them only under
+   the confirmed-unable rule above.
 9. **Worker untouched.** The running worker (src/index.mjs) is not modified
    and does not import the backfill modules. The backfill runs as a CLI
    command (detect, repair, report), manually or from a timer/unit that a
@@ -134,13 +138,17 @@ how the mechanism is verified without touching a production database.
 |---|---|
 | ingest/src/backfill/detect.mjs | pure gap detectors: `detectPriceGaps`, `detectGasPriceGaps`, `detectBucketGaps`, `medianIntervalBuckets`. No I/O. |
 | ingest/src/backfill/sources/ha-history.mjs | HA REST history client (`fetchEntityHistory`) and `haHttpBaseFromWsUrl`. Fail-soft: returns a typed `{error}` object, never throws past the plugin boundary. |
-| ingest/src/backfill/repair.mjs | orchestrator `runBackfill` plus `createRowLoader` (SQL row loader). Replay, corroboration, budget, outcomes. |
+| ingest/src/backfill/sources/price-forecast.mjs | Zonneplan tariff forecast (`fetchPriceForecast`, `parseForecastHours`): 15-minute blocks averaged into hours, 1e-7 EUR/kWh converted to EUR. Only hours the attribute covers are provided. |
+| ingest/src/backfill/sources/price-history.mjs | price fallback (`fetchTariffHistory`, `hourlyPricesFromStates`): recorder history of the tariff entity, last observation per hour wins. |
+| ingest/src/backfill/sources/gas-price-history.mjs | gas price source (`fetchGasPriceHistory`, `dailyPricesFromStates`, `localDayStartMs`): recorder history of the configured gas price entity, first observation per local day wins. |
+| ingest/src/backfill/repair.mjs | orchestrator `runBackfill` plus the SQL loaders (rows, price hours, gas days). Replay, corroboration, budget, price/gas repair, permanent registration, outcomes. |
 | ingest/src/backfill/writer.mjs | `BackfillWriter`: engine-writer adapter that labels writes with the backfill source and tracks pending inserts. |
-| ingest/src/backfill/log.mjs | `createBackfillLog`: backfill_log inserts, permanent-range registry (mark permanent, is-permanent), recent rows. |
-| ingest/src/backfill/cli.mjs | commands detect, repair (default), report; flags --kind, --entity, --since, --dry-run, --limit. |
+| ingest/src/backfill/log.mjs | `createBackfillLog`: backfill_log inserts, permanent-range registry (mark permanent, is-permanent, permanent ranges), recent rows. |
+| ingest/src/backfill/cli.mjs | commands detect, repair (default), report; flags --kind, --entity, --since, --dry-run, --auto, --limit. |
 | ingest/src/db.mjs | DbWriter with the additive `source` parameter (default `ingest`); write methods return their insert count. |
 | ingest/scripts/verify-backfill.mjs | manual verification script with fake writer, fake fetch and fake log (no database, no Home Assistant). |
 | ingest/test/backfill-detect.test.mjs | unit tests of the pure detectors (node:test). |
+| deploy/ems-backfill.service + .timer | oneshot service and hourly timer for the automated repair run. |
 | deploy/migrations/003_backfill_log.sql | idempotent migration creating `backfill_log`. |
 
 ## 6. Gap detection rules
@@ -231,6 +239,55 @@ For each configured entity of kind `sample` or `counter`:
 `--dry-run` performs detection and the history fetches but performs no
 writes at all: no replay, no backfill_log inserts, no permanent marking.
 
+### 7.1 Price and gas price repair
+
+Prices (kind `price`): `detectPriceGaps` over the price table (tariff
+`normaal`) within the lookback window, minus the hours fully covered by
+permanent ranges. Every missing hour is repaired from two sources in order:
+
+1. The Zonneplan tariff forecast (plugin `zonneplan-forecast`): the entity
+   sensor.zonneplan_current_quarter_hourly_electricity_tariff carries a
+   rolling forecast attribute with 15-minute blocks; the blocks of an hour
+   are averaged (up to 4) and the amount is converted from 1e-7 EUR/kWh to
+   EUR/kWh. Only hours the attribute actually covers are provided; hours
+   before the rolling window start fall through to the fallback.
+2. The recorder history of the tariff entity (plugin `zonneplan-history`):
+   every state observation is mapped to the start of its hour and the last
+   observation before the hour boundary wins, matching the engine's
+   writePrice-on-change upsert semantics.
+
+A source that yields nothing for an hour does not fail the run. Rows are
+written with tariff `normaal` and source `zonneplan-backfill` (the same
+writePrice shape as the live path, additive source), only for hours detected
+missing, so no existing row is ever touched. Hours no source covers are
+retried while they are recent (outcome `partial`); once older than the
+recorder retention window they are registered permanent (outcome
+`permanent`), but only when the fallback source was consulted and answered.
+
+Gas prices (kind `gas_price`): `detectGasPriceGaps` over the gas_price
+table, minus the days fully covered by permanent ranges. The recorder
+history of the configured gas price entity (entity id from config.json, not
+hardcoded twice) is fetched for the missing-day range; every state
+observation is a candidate for the LOCAL day (Europe/Amsterdam, the same
+dayOf semantics as the engine) it was observed in, and the first observation
+per local day wins, so an evening pre-publication of the next day's price
+never leaks into the current day. Uncovered days follow the same
+retry-then-permanent rule as the price hours.
+
+Both paths record their provenance per run: `run_kind` (auto for the hourly
+timer, cli for manual runs) and `source` (the plugin that supplied the
+rows; `zonneplan-forecast` when the forecast supplied at least as many hours
+as the fallback, otherwise `zonneplan-history`; `zonneplan-history` for the
+gas path). The structured detail carries the exact per-plugin counters.
+
+### 7.2 Automation
+
+deploy/ems-backfill.timer starts deploy/ems-backfill.service hourly
+(RandomizedDelaySec 300, Persistent true). The service is a oneshot that
+runs `cli.mjs repair --auto`: run_kind `auto`, a journal-friendly one-line
+summary per entity, and exit 0 for every data outcome (source-down is
+retried by the next hourly run). See deploy/README.md for installation.
+
 ## 8. Schema
 
 `backfill_log` is a plain table (not a hypertable): one row per entity and
@@ -307,6 +364,7 @@ Secrets and connection details come from the existing ingest/.env
 | EMS_BACKFILL_LOOKBACK_DAYS | 7 | detection window in days (before now) |
 | EMS_BACKFILL_MAX_ROWS_PER_RUN | 5000 | maximum replayed states per repair run |
 | EMS_BACKFILL_MAX_GAP_BUCKETS | 36 | maximum span in buckets of a repairable gap |
+| EMS_BACKFILL_RECORDER_RETENTION_DAYS | 40 | uncovered hours/days older than this window are registered permanent |
 
 ```bash
 cd ingest

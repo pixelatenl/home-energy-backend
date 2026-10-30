@@ -1,28 +1,46 @@
 // Orchestrator of the backfill repair (see docs/backfill-design.md,
-// sections 2, 3 and 7). For each configured entity of kind "sample" or
-// "counter" it:
-//   1. detects gaps in the lookback window (cadence-aware, pure detector);
-//   2. fetches the Home Assistant recorder history for each repairable gap;
-//   3. replays the fetched states through a fresh IngestEngine (per entity)
-//      into the injected writer, so bucket and delta semantics stay with the
-//      engine and repaired rows are byte-for-byte what the worker would have
-//      written, with the backfill source label;
-//   4. corroborates an empty fetch against the other configured entities
-//      (entity silence vs recorder down);
-//   5. writes exactly one backfill_log row per entity/kind with the outcome
-//      and honest bookkeeping (rows_written next to rows_missing), carrying
-//      the run provenance (run_kind, source).
+// sections 2, 3 and 7).
 //
-// Everything with a side effect is injected (row loader, history fetch,
-// db writer, log store), so unit tests and the verification script can run
-// the real orchestration against fakes. The run is bounded: at most
-// maxRowsPerRun replayed states per run (outcome partial when it stops
-// mid-way). dryRun performs detection and fetches but no writes at all.
+// Samples and counters (kinds "sample" and "counter"): for each configured
+// entity it detects gaps in the lookback window (cadence-aware, pure
+// detector), fetches the Home Assistant recorder history for each repairable
+// gap and replays the fetched states through a fresh IngestEngine (per
+// entity) into the injected writer, so bucket and delta semantics stay with
+// the engine and repaired rows are byte-for-byte what the worker would have
+// written, with the backfill source label.
+//
+// Hourly prices (kind "price"): missing hours on the hourly grid are
+// repaired from the Zonneplan forecast attribute first (plugin
+// zonneplan-forecast) and from the recorder history of the tariff entity as
+// the fallback (plugin zonneplan-history), rows labelled zonneplan-backfill.
+// Hours the sources do not cover stay missing: recent ones are retried on
+// the next run (outcome partial), hours older than the recorder retention
+// window are registered permanent (the sources are confirmed unable to cover
+// them; the fallback source was consulted and answered).
+//
+// Daily gas prices (kind "gas_price"): missing local days are recovered from
+// the recorder history of the configured gas price entity, first observation
+// per local day wins (engine semantics), same permanent/retry rules.
+//
+// Every path writes exactly one backfill_log row per entity and kind with
+// the outcome and honest bookkeeping (rows_written next to rows_missing),
+// carrying the run provenance (run_kind, source). Everything with a side
+// effect is injected (row loaders, source fetches, db writer, log store),
+// so unit tests and the verification script can run the real orchestration
+// against fakes. The run is bounded: at most maxRowsPerRun replayed states
+// per run (outcome partial when it stops mid-way), and the detection window
+// is bounded by the lookback days. dryRun performs detection and fetches but
+// no writes at all. A source that is merely down never confirms inability:
+// its outcome is source-down (retried next run), never permanent.
 
-import { BUCKET_MS, DAY_MS } from "../buckets.mjs";
+import { BUCKET_MS, DAY_MS, HOUR_MS, dayOf } from "../buckets.mjs";
 import { IngestEngine } from "../engine.mjs";
-import { detectBucketGaps } from "./detect.mjs";
+import { detectBucketGaps, detectPriceGaps, detectGasPriceGaps } from "./detect.mjs";
 import { BackfillWriter } from "./writer.mjs";
+import { localDayStartMs, nextDay } from "./sources/gas-price-history.mjs";
+
+/** Row label written into price and gas_price rows by these paths. */
+export const PRICE_BACKFILL_SOURCE = "zonneplan-backfill";
 
 /**
  * SQL row loader: the bucket starts an entity already has in the database.
@@ -46,6 +64,32 @@ export function createRowLoader(pool, ids) {
   };
 }
 
+/** SQL loader: hour starts already present in the price table (tariff normaal). */
+export function createPriceHoursLoader(pool) {
+  return async function loadPriceHours(fromMs, toMs) {
+    const res = await pool.query(
+      `SELECT ts FROM price
+       WHERE tariff = 'normaal' AND ts >= $1 AND ts < $2
+       ORDER BY ts`,
+      [new Date(fromMs).toISOString(), new Date(toMs).toISOString()]
+    );
+    return res.rows.map((r) => new Date(r.ts).getTime());
+  };
+}
+
+/** SQL loader: local days already present in the gas_price table. */
+export function createGasDaysLoader(pool) {
+  return async function loadGasDays(fromDay, toDay) {
+    const res = await pool.query(
+      `SELECT day FROM gas_price
+       WHERE day >= $1 AND day <= $2
+       ORDER BY day`,
+      [fromDay, toDay]
+    );
+    return res.rows.map((r) => String(r.day));
+  };
+}
+
 /**
  * Run the backfill repair over the configured entities.
  *
@@ -54,13 +98,16 @@ export function createRowLoader(pool, ids) {
  * @param {number} [options.lookbackDays=7] - EMS_BACKFILL_LOOKBACK_DAYS
  * @param {number} [options.maxRowsPerRun=5000] - EMS_BACKFILL_MAX_ROWS_PER_RUN
  * @param {number} [options.maxGapBuckets=36] - EMS_BACKFILL_MAX_GAP_BUCKETS
+ * @param {number} [options.recorderRetentionDays=40] -
+ *   EMS_BACKFILL_RECORDER_RETENTION_DAYS; hours/days older than this window
+ *   cannot be covered by the recorder and may be registered permanent
  * @param {string} [options.timeZone] - EMS_TIMEZONE
  * @param {string} [options.source] - source label written into repaired rows
  *   (energy_delta.source; 'backfill-ha-history' for this path)
  * @param {string} [options.logSource] - plugin recorded in backfill_log.source
- *   ('ha-history' for this path; the later plugins add their values)
+ *   for sample/counter runs ('ha-history')
  * @param {string} [options.runKind] - provenance in backfill_log.run_kind
- *   ('cli' today; the hourly timer of the next block passes 'auto')
+ *   ('cli' or 'auto')
  * @param {() => number} [options.now] - injectable clock
  * @param {number|null} [options.sinceMs] - explicit window start (--since)
  * @param {Function} options.loadRows - async (cfg, fromMs, toMs) => number[]
@@ -68,6 +115,14 @@ export function createRowLoader(pool, ids) {
  *   {states: [{entity_id, state, last_updated_ts}]} | {error: {code, message}}
  * @param {object} options.dbWriter - DbWriter (or fake with the same contract)
  * @param {object} options.log - store from createBackfillLog (or a fake)
+ * @param {Function} [options.loadPriceHours] - async (fromMs, toMs) => number[]
+ * @param {Function} [options.fetchPriceForecast] - async () =>
+ *   {hours: [{startMs, priceEur}]} | {error}
+ * @param {Function} [options.fetchPriceHistory] - async (fromMs, toMs) =>
+ *   {hours: [{startMs, priceEur}]} | {error}
+ * @param {Function} [options.loadGasDays] - async (fromDay, toDay) => string[]
+ * @param {Function} [options.fetchGasHistory] - async (cfg, fromMs, toMs) =>
+ *   {days: [{day, priceEur}]} | {error}
  * @param {boolean} [options.dryRun] - detect + fetch, no writes
  * @returns {Promise<{fromMs: number, toMs: number, results: Array<object>}>}
  */
@@ -77,6 +132,7 @@ export async function runBackfill(options = {}) {
     lookbackDays = 7,
     maxRowsPerRun = 5000,
     maxGapBuckets = 36,
+    recorderRetentionDays = 40,
     timeZone = "Europe/Amsterdam",
     source = "backfill-ha-history",
     logSource = "ha-history",
@@ -87,10 +143,23 @@ export async function runBackfill(options = {}) {
     fetchHistory,
     dbWriter,
     log,
+    loadPriceHours,
+    fetchPriceForecast,
+    fetchPriceHistory,
+    loadGasDays,
+    fetchGasHistory,
     dryRun = false,
   } = options;
   if (typeof loadRows !== "function" || typeof fetchHistory !== "function" || !dbWriter || !log) {
     throw new Error("runBackfill requires loadRows, fetchHistory, dbWriter and log");
+  }
+  const priceCandidates = entities.filter((e) => e.kind === "price");
+  if (priceCandidates.length > 0 && (typeof loadPriceHours !== "function" || typeof fetchPriceForecast !== "function" || typeof fetchPriceHistory !== "function")) {
+    throw new Error("runBackfill requires loadPriceHours, fetchPriceForecast and fetchPriceHistory for kind price");
+  }
+  const gasCandidates = entities.filter((e) => e.kind === "gas_price");
+  if (gasCandidates.length > 0 && (typeof loadGasDays !== "function" || typeof fetchGasHistory !== "function")) {
+    throw new Error("runBackfill requires loadGasDays and fetchGasHistory for kind gas_price");
   }
 
   const toMs = now();
@@ -98,14 +167,60 @@ export async function runBackfill(options = {}) {
   const state = { budget: Math.max(0, maxRowsPerRun) };
   const candidates = entities.filter((e) => e.kind === "sample" || e.kind === "counter");
 
+  const c = { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, logSource, runKind, recorderRetentionDays, maxGapBuckets, loadPriceHours, fetchPriceForecast, fetchPriceHistory, loadGasDays, fetchGasHistory, dryRun };
+
   const results = [];
   for (const cfg of candidates) {
-    results.push(await repairEntity(cfg, { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, logSource, runKind, maxGapBuckets, dryRun }));
+    results.push(await repairEntity(cfg, c));
+  }
+  // One price pipeline per run: every kind "price" entity shares the same
+  // source (the tariff entity) and the same price table, so the first
+  // configured price entity is the audit id for the run.
+  if (priceCandidates.length > 0) {
+    results.push(await repairPriceEntity(priceCandidates[0], c));
+  }
+  for (const cfg of gasCandidates) {
+    results.push(await repairGasEntity(cfg, c));
   }
   return { fromMs, toMs, results };
 }
 
-/** Repair one entity; returns the per-entity result (also the log entry). */
+/** Base result object shared by all per-entity repair functions. */
+function baseResult(cfg, kind, c) {
+  return {
+    haEntityId: cfg.haEntityId,
+    kind,
+    runKind: c.runKind,
+    source: "none",
+    outcome: "no-gap",
+    rowsWritten: 0,
+    rowsMissing: 0,
+    statesReplayed: 0,
+    rangeStartMs: c.fromMs,
+    rangeEndMs: c.toMs,
+    detail: null,
+  };
+}
+
+/** Insert the log row (unless dry-run: no writes at all). */
+async function finish(res, c) {
+  if (!c.dryRun) {
+    await c.log.insert({
+      haEntityId: res.haEntityId,
+      kind: res.kind,
+      runKind: res.runKind,
+      source: res.source,
+      outcome: res.outcome,
+      rangeStartMs: res.rangeStartMs,
+      rangeEndMs: res.rangeEndMs,
+      rowsWritten: res.rowsWritten,
+      rowsMissing: res.rowsMissing,
+      detail: res.detail,
+    });
+  }
+}
+
+/** Repair one sample/counter entity; returns the per-entity result. */
 async function repairEntity(cfg, c) {
   const rows = await c.loadRows(cfg, c.fromMs, c.toMs);
   const det = detectBucketGaps(rows, c.fromMs, c.toMs, { maxGapBuckets: c.maxGapBuckets });
@@ -117,21 +232,11 @@ async function repairEntity(cfg, c) {
   // detected missing buckets with rows_missing 0.
   const totalMissing = det.repairable.reduce((a, g) => a + g.missingBuckets, 0);
 
-  const res = {
-    haEntityId: cfg.haEntityId,
-    kind: cfg.kind,
-    runKind: c.runKind,
-    source: c.logSource,
-    outcome: "no-gap",
-    rowsWritten: 0,
-    rowsMissing: totalMissing,
-    statesReplayed: 0,
-    gapsRepairable: det.repairable.length,
-    gapsReportable: det.reportable.length,
-    rangeStartMs: c.fromMs,
-    rangeEndMs: c.toMs,
-    detail: null,
-  };
+  const res = baseResult(cfg, cfg.kind, c);
+  res.source = c.logSource;
+  res.rowsMissing = totalMissing;
+  res.gapsRepairable = det.repairable.length;
+  res.gapsReportable = det.reportable.length;
 
   if (det.repairable.length === 0) {
     res.detail = detailObject(0, 0, 0, 0, det.reportable.length, false, false);
@@ -246,26 +351,329 @@ async function corroboratedSilence(cfg, g, c) {
   return false;
 }
 
-/** Insert the log row (unless dry-run: no writes at all). */
-async function finish(res, c) {
-  if (!c.dryRun) {
-    await c.log.insert({
-      haEntityId: res.haEntityId,
-      kind: res.kind,
-      runKind: res.runKind,
-      source: res.source,
-      outcome: res.outcome,
-      rangeStartMs: res.rangeStartMs,
-      rangeEndMs: res.rangeEndMs,
-      rowsWritten: res.rowsWritten,
-      rowsMissing: res.rowsMissing,
-      detail: res.detail,
+/** Group sorted hour starts into contiguous [startMs, endMs) ranges. */
+function toHourRanges(hours) {
+  const ranges = [];
+  for (const h of hours) {
+    const last = ranges[ranges.length - 1];
+    if (last && last.endMs === h) last.endMs = h + HOUR_MS;
+    else ranges.push({ startMs: h, endMs: h + HOUR_MS });
+  }
+  return ranges;
+}
+
+/** Group sorted day strings into contiguous runs. */
+function toDayRuns(days) {
+  const runs = [];
+  for (const d of days) {
+    const last = runs[runs.length - 1];
+    if (last && nextDay(last[last.length - 1]) === d) last.push(d);
+    else runs.push([d]);
+  }
+  return runs;
+}
+
+/**
+ * Register the given hours/days as permanent ranges. Only called when the
+ * fallback source was consulted and answered (no fetch error): a merely down
+ * source never confirms inability, so it never makes a range permanent.
+ */
+async function registerPermanentRanges(c, { haEntityId, kind, ranges, detail }) {
+  for (const r of ranges) {
+    await c.log.markPermanent({
+      haEntityId,
+      kind,
+      runKind: c.runKind,
+      source: "zonneplan-history", // the plugin that confirmed inability
+      rangeStartMs: r.startMs,
+      rangeEndMs: r.endMs,
+      rowsMissing: r.missingCount,
+      detail,
     });
   }
 }
 
 /**
- * Structured detail for backfill_log.detail (JSONB): a human-readable
+ * Repair the hourly prices. Forecast first, recorder history fallback
+ * second; a source that yields nothing for an hour does not fail the run.
+ * Hours no source covers are retried while they are recent, and registered
+ * permanent once they are older than the recorder retention window.
+ */
+async function repairPriceEntity(cfg, c) {
+  const existing = await c.loadPriceHours(c.fromMs, c.toMs);
+  const runs = detectPriceGaps(existing, c.fromMs, c.toMs);
+  const detectedHours = [];
+  for (const r of runs) {
+    for (let t = r.startMs; t < r.endMs; t += HOUR_MS) detectedHours.push(t);
+  }
+  detectedHours.sort((a, b) => a - b);
+
+  const res = baseResult(cfg, "price", c);
+  res.rowsMissing = detectedHours.length;
+  const d = {
+    detected: detectedHours.length,
+    fromForecast: 0,
+    fromHistory: 0,
+    inPermanent: 0,
+    uncoveredRecent: 0,
+    registeredPermanent: 0,
+    forecastError: null,
+    historyError: null,
+  };
+
+  if (runs.length > 0) {
+    res.rangeStartMs = detectedHours[0];
+    res.rangeEndMs = detectedHours[detectedHours.length - 1] + HOUR_MS;
+  }
+
+  if (runs.length === 0) {
+    res.detail = priceDetail(d);
+    await finish(res, c);
+    return res;
+  }
+
+  // Permanent exclusion: an hour is excluded when a permanent range fully
+  // covers it (the registered ranges are hour-aligned).
+  const perm = await c.log.permanentRanges(cfg.haEntityId, "price", c.fromMs, c.toMs);
+  const hourInPermanent = (h) => perm.some((r) => r.startMs <= h && r.endMs >= h + HOUR_MS);
+  const missingHours = detectedHours.filter((h) => !hourInPermanent(h));
+  d.inPermanent = detectedHours.length - missingHours.length;
+
+  if (missingHours.length === 0) {
+    res.outcome = "permanent";
+    res.detail = priceDetail(d);
+    await finish(res, c);
+    return res;
+  }
+
+  // Forecast first (rolling window, one fetch per run).
+  let forecastHours = new Map();
+  const fr = await c.fetchPriceForecast();
+  if (fr === null || fr === undefined || fr.error) {
+    d.forecastError = fr?.error?.code ?? "unknown";
+  } else {
+    forecastHours = new Map((fr.hours ?? []).map((h) => [h.startMs, h.priceEur]));
+  }
+
+  const bfWriter = new BackfillWriter(c.dbWriter, PRICE_BACKFILL_SOURCE);
+  const fromForecast = [];
+  for (const h of missingHours) {
+    if (forecastHours.has(h)) {
+      if (!c.dryRun) bfWriter.writePrice(cfg, h, forecastHours.get(h));
+      fromForecast.push(h);
+    }
+  }
+  d.fromForecast = fromForecast.length;
+
+  // History fallback for the hours the forecast does not cover.
+  const remaining = missingHours.filter((h) => !forecastHours.has(h));
+  let historyHours = new Map();
+  if (remaining.length > 0) {
+    const hr = await c.fetchPriceHistory(remaining[0], remaining[remaining.length - 1] + HOUR_MS);
+    if (hr === null || hr === undefined || hr.error) {
+      d.historyError = hr?.error?.code ?? "unknown";
+    } else {
+      historyHours = new Map((hr.hours ?? []).map((h) => [h.startMs, h.priceEur]));
+    }
+  }
+  const fromHistory = remaining.filter((h) => historyHours.has(h));
+  if (!c.dryRun) {
+    for (const h of fromHistory) bfWriter.writePrice(cfg, h, historyHours.get(h));
+  }
+  d.fromHistory = fromHistory.length;
+
+  res.rowsWritten = c.dryRun ? 0 : await bfWriter.flush();
+  res.rowsMissing = Math.max(0, detectedHours.length - res.rowsWritten);
+
+  // Hours no source covers: retried while recent; older than the recorder
+  // retention window they are registered permanent, but only when the
+  // fallback source answered (a down source confirms nothing).
+  const written = new Set([...fromForecast, ...fromHistory]);
+  const uncovered = missingHours.filter((h) => !written.has(h));
+  const cutoff = c.toMs - Math.max(0, c.recorderRetentionDays) * DAY_MS;
+  const permanentHours = d.historyError ? [] : uncovered.filter((h) => h < cutoff);
+  d.uncoveredRecent = uncovered.length - permanentHours.length;
+  d.registeredPermanent = permanentHours.length;
+  if (permanentHours.length > 0 && !c.dryRun) {
+    await registerPermanentRanges(c, {
+      haEntityId: cfg.haEntityId,
+      kind: "price",
+      ranges: toHourRanges(permanentHours).map((r) => ({ ...r, missingCount: (r.endMs - r.startMs) / HOUR_MS })),
+      detail: { summary: "hours older than recorder retention, no source covers them" },
+    });
+  }
+
+  if (d.historyError && res.rowsWritten === 0 && permanentHours.length === 0) {
+    res.outcome = "source-down";
+  } else if (d.uncoveredRecent > 0) {
+    res.outcome = "partial";
+  } else if (res.rowsWritten > 0) {
+    res.outcome = "repaired";
+  } else if (permanentHours.length > 0) {
+    res.outcome = "permanent";
+  }
+  res.source =
+    fromForecast.length >= fromHistory.length && fromForecast.length > 0
+      ? "zonneplan-forecast"
+      : fromHistory.length > 0
+        ? "zonneplan-history"
+        : "none";
+  res.detail = priceDetail(d);
+  await finish(res, c);
+  return res;
+}
+
+/** Structured detail for a price run (JSONB). */
+function priceDetail(d) {
+  const parts = [];
+  if (d.fromForecast > 0) parts.push(`${d.fromForecast} hour(s) from forecast`);
+  if (d.fromHistory > 0) parts.push(`${d.fromHistory} hour(s) from history`);
+  if (d.inPermanent > 0) parts.push(`${d.inPermanent} hour(s) already in permanent range(s)`);
+  if (d.uncoveredRecent > 0) parts.push(`${d.uncoveredRecent} hour(s) uncovered (recent, retried)`);
+  if (d.registeredPermanent > 0) parts.push(`${d.registeredPermanent} hour(s) registered permanent`);
+  if (d.forecastError) parts.push(`forecast source down (${d.forecastError})`);
+  if (d.historyError) parts.push(`history source down (${d.historyError})`);
+  if (parts.length === 0) parts.push("no gaps");
+  return {
+    summary: parts.join(", "),
+    hours_detected_missing: d.detected,
+    hours_from_forecast: d.fromForecast,
+    hours_from_history: d.fromHistory,
+    hours_in_permanent_ranges: d.inPermanent,
+    hours_uncovered_recent: d.uncoveredRecent,
+    hours_registered_permanent: d.registeredPermanent,
+    forecast_error: d.forecastError,
+    history_error: d.historyError,
+  };
+}
+
+/**
+ * Repair the daily gas prices from the recorder history of the configured
+ * gas price entity. Uncovered days follow the same retry/permanent rules as
+ * the price hours.
+ */
+async function repairGasEntity(cfg, c) {
+  const tz = c.timeZone;
+  const fromDay = dayOf(c.fromMs, tz);
+  const toDay = dayOf(c.toMs, tz);
+  const existingDays = await c.loadGasDays(fromDay, toDay);
+  const detectedDays = detectGasPriceGaps(existingDays, fromDay, toDay); // ascending day strings
+
+  const res = baseResult(cfg, "gas_price", c);
+  res.source = "zonneplan-history";
+  res.rowsMissing = detectedDays.length;
+  const d = {
+    detected: detectedDays.length,
+    fromHistory: 0,
+    inPermanent: 0,
+    uncoveredRecent: 0,
+    registeredPermanent: 0,
+    historyError: null,
+  };
+
+  if (detectedDays.length > 0) {
+    res.rangeStartMs = localDayStartMs(detectedDays[0], tz);
+    res.rangeEndMs = localDayStartMs(nextDay(detectedDays[detectedDays.length - 1]), tz);
+  }
+
+  if (detectedDays.length === 0) {
+    res.detail = gasDetail(d);
+    await finish(res, c);
+    return res;
+  }
+
+  // Permanent exclusion: a day is excluded when a permanent range fully
+  // covers its local-day span (the registered ranges are day-aligned).
+  const perm = await c.log.permanentRanges(
+    cfg.haEntityId, "gas_price",
+    localDayStartMs(fromDay, tz), localDayStartMs(nextDay(toDay), tz)
+  );
+  const dayInPermanent = (day) =>
+    perm.some((r) => r.startMs <= localDayStartMs(day, tz) && r.endMs >= localDayStartMs(nextDay(day), tz));
+  const missingDays = detectedDays.filter((day) => !dayInPermanent(day));
+  d.inPermanent = detectedDays.length - missingDays.length;
+
+  if (missingDays.length === 0) {
+    res.outcome = "permanent";
+    res.detail = gasDetail(d);
+    await finish(res, c);
+    return res;
+  }
+
+  const fetchStart = localDayStartMs(missingDays[0], tz);
+  const fetchEnd = localDayStartMs(nextDay(missingDays[missingDays.length - 1]), tz);
+  const hr = await c.fetchGasHistory(cfg, fetchStart, fetchEnd);
+  let dayPrices = new Map();
+  if (hr === null || hr === undefined || hr.error) {
+    d.historyError = hr?.error?.code ?? "unknown";
+  } else {
+    dayPrices = new Map((hr.days ?? []).map((x) => [x.day, x.priceEur]));
+  }
+
+  const bfWriter = new BackfillWriter(c.dbWriter, PRICE_BACKFILL_SOURCE);
+  const writtenDays = missingDays.filter((day) => dayPrices.has(day));
+  if (!c.dryRun) {
+    for (const day of writtenDays) bfWriter.writeGasPrice(cfg, day, dayPrices.get(day));
+  }
+  d.fromHistory = writtenDays.length;
+
+  res.rowsWritten = c.dryRun ? 0 : await bfWriter.flush();
+  res.rowsMissing = Math.max(0, detectedDays.length - res.rowsWritten);
+
+  const uncoveredDays = missingDays.filter((day) => !dayPrices.has(day));
+  const cutoff = c.toMs - Math.max(0, c.recorderRetentionDays) * DAY_MS;
+  const permanentDays = d.historyError ? [] : uncoveredDays.filter((day) => localDayStartMs(day, tz) < cutoff);
+  d.uncoveredRecent = uncoveredDays.length - permanentDays.length;
+  d.registeredPermanent = permanentDays.length;
+  if (permanentDays.length > 0 && !c.dryRun) {
+    await registerPermanentRanges(c, {
+      haEntityId: cfg.haEntityId,
+      kind: "gas_price",
+      ranges: toDayRuns(permanentDays).map((run) => ({
+        startMs: localDayStartMs(run[0], tz),
+        endMs: localDayStartMs(nextDay(run[run.length - 1]), tz),
+        missingCount: run.length,
+      })),
+      detail: { summary: "days older than recorder retention, no source covers them" },
+    });
+  }
+
+  if (d.historyError && res.rowsWritten === 0) {
+    res.outcome = "source-down";
+  } else if (d.uncoveredRecent > 0) {
+    res.outcome = "partial";
+  } else if (res.rowsWritten > 0) {
+    res.outcome = "repaired";
+  } else if (permanentDays.length > 0) {
+    res.outcome = "permanent";
+  }
+  res.detail = gasDetail(d);
+  await finish(res, c);
+  return res;
+}
+
+/** Structured detail for a gas price run (JSONB). */
+function gasDetail(d) {
+  const parts = [];
+  if (d.fromHistory > 0) parts.push(`${d.fromHistory} day(s) from history`);
+  if (d.inPermanent > 0) parts.push(`${d.inPermanent} day(s) already in permanent range(s)`);
+  if (d.uncoveredRecent > 0) parts.push(`${d.uncoveredRecent} day(s) uncovered (recent, retried)`);
+  if (d.registeredPermanent > 0) parts.push(`${d.registeredPermanent} day(s) registered permanent`);
+  if (d.historyError) parts.push(`history source down (${d.historyError})`);
+  if (parts.length === 0) parts.push("no gaps");
+  return {
+    summary: parts.join(", "),
+    days_detected_missing: d.detected,
+    days_from_history: d.fromHistory,
+    days_in_permanent_ranges: d.inPermanent,
+    days_uncovered_recent: d.uncoveredRecent,
+    days_registered_permanent: d.registeredPermanent,
+    history_error: d.historyError,
+  };
+}
+
+/**
+ * Structured detail for sample/counter runs (JSONB): a human-readable
  * summary field plus the counters of the run.
  */
 function detailObject(repaired, silent, down, permanent, reportable, truncated, unattempted) {
