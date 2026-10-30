@@ -110,11 +110,16 @@ export function createPriceHoursLoader(pool) {
   };
 }
 
-/** SQL loader: local days already present in the gas_price table. */
+/**
+ * SQL loader: local days already present in the gas_price table. The day is
+ * selected as text: node-pg parses DATE columns into JavaScript Date objects,
+ * whose String() form is not "YYYY-MM-DD" and would never match the
+ * detector's present-set, so every run would re-detect in-window days.
+ */
 export function createGasDaysLoader(pool) {
   return async function loadGasDays(fromDay, toDay) {
     const res = await pool.query(
-      `SELECT day FROM gas_price
+      `SELECT day::text AS day FROM gas_price
        WHERE day >= $1 AND day <= $2
        ORDER BY day`,
       [fromDay, toDay]
@@ -287,7 +292,7 @@ async function repairEntity(cfg, c) {
   res.gapsReportable = det.reportable.length;
 
   if (det.repairable.length === 0) {
-    res.detail = detailObject(0, 0, 0, 0, det.reportable.length, false, false);
+    res.detail = detailObject(0, 0, 0, 0, 0, det.reportable.length, false, false);
     await finish(res, c);
     return res;
   }

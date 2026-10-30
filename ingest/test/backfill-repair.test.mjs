@@ -7,7 +7,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runBackfill } from "../src/backfill/repair.mjs";
+import { runBackfill, createGasDaysLoader } from "../src/backfill/repair.mjs";
 
 const BUCKET = 5 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
@@ -414,4 +414,64 @@ test("gas price repair end to end: missing days recovered, uncovered recent day 
   assert.equal(entry.source, "zonneplan-history");
   assert.equal(entry.detail.days_from_history, 1);
   assert.equal(entry.detail.days_uncovered_recent, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Regression pins from the third live repair run
+
+test("regression: an entity with only reportable runs books them as reportable, never as permanent", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  let fetchCalls = 0;
+
+  // Rows 0..9 and nothing after: the trailing run (buckets 10..47) exceeds
+  // the cadence threshold but has no later row, so it is reportable
+  // ("unbounded") and the entity has zero repairable gaps.
+  const rows = [];
+  for (let i = 0; i <= 9; i++) rows.push(i * BUCKET);
+
+  const { results } = await runBackfill({
+    entities: [counterEntity],
+    sinceMs: 0,
+    now: () => WINDOW,
+    loadRows: async () => rows,
+    fetchHistory: async () => {
+      fetchCalls += 1;
+      return { states: [] };
+    },
+    dbWriter: db,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.outcome, "no-gap");
+  assert.equal(fetchCalls, 0, "nothing repairable: no fetch");
+  assert.equal(r.detail.gaps_permanent, 0, "no gap was in a permanent range");
+  assert.equal(r.detail.runs_reportable, 1);
+  assert.equal(r.detail.summary, "1 run(s) reportable but not repairable");
+  assert.equal(log.rows[0].detail.summary, "1 run(s) reportable but not repairable");
+  assert.equal(log.rows[0].detail.gaps_permanent, 0);
+});
+
+test("gas days loader: the day is selected as text, so the rows are YYYY-MM-DD strings", async () => {
+  const queries = [];
+  const pool = {
+    query: async (text, params) => {
+      queries.push({ text, params });
+      // The cast already happened in the database: the rows carry strings.
+      return { rows: [{ day: "2026-10-21" }, { day: "2026-10-22" }] };
+    },
+  };
+
+  const days = await createGasDaysLoader(pool)("2026-10-20", "2026-10-23");
+
+  // node-pg parses DATE columns into JavaScript Date objects, whose
+  // String() form ("Wed Oct 21 2026 ...") never matches the detector's
+  // present-set; the ::text cast keeps the mapping timezone-independent.
+  assert.match(queries[0].text, /SELECT day::text AS day FROM gas_price/);
+  assert.match(queries[0].text, /WHERE day >= \$1 AND day <= \$2/);
+  assert.match(queries[0].text, /ORDER BY day/);
+  assert.deepEqual(queries[0].params, ["2026-10-20", "2026-10-23"]);
+  assert.deepEqual(days, ["2026-10-21", "2026-10-22"]);
+  assert.ok(days.every((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)), "YYYY-MM-DD, not a Date string");
 });
