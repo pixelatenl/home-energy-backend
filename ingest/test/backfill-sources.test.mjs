@@ -8,6 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parseForecastHours } from "../src/backfill/sources/price-forecast.mjs";
+import { fetchEntityHistory } from "../src/backfill/sources/ha-history.mjs";
 import { hourlyPricesFromStates } from "../src/backfill/sources/price-history.mjs";
 import {
   dailyPricesFromStates,
@@ -202,4 +203,46 @@ test("nextDay: the local day after a day string", () => {
   assert.equal(nextDay("2026-10-12"), "2026-10-13");
   assert.equal(nextDay("2026-10-31"), "2026-11-01");
   assert.equal(nextDay("2026-12-31"), "2027-01-01");
+});
+
+// ---------------------------------------------------------------------------
+// HA history client (ha-history.mjs), fetch faked: no network
+
+test("fetchEntityHistory: the start is the single path segment, the end time is the end_time query parameter", async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => [[
+        { entity_id: "sensor.grid_consumption_total", state: "104.5", last_updated_ts: 1770000000 },
+      ]],
+    };
+  };
+
+  const result = await fetchEntityHistory({
+    httpBase: "http://localhost:8123/", // trailing slash must be stripped
+    token: "secret",
+    entityId: "sensor.grid_consumption_total",
+    startMs: Date.parse("2026-02-10T00:00:00Z"),
+    endMs: Date.parse("2026-02-10T12:00:00Z"),
+    fetchFn,
+  });
+
+  // HA serves history at GET /api/history/period/<start> with the end time
+  // as the end_time query parameter; the end time in the path matches no
+  // route (live-verified 404).
+  assert.equal(
+    calls[0],
+    "http://localhost:8123/api/history/period/2026-02-10T00:00:00.000Z" +
+      "?end_time=2026-02-10T12%3A00%3A00.000Z" +
+      "&filter_entity_id=sensor.grid_consumption_total"
+  );
+  assert.equal(calls.length, 1, "exactly one request");
+
+  // The response is normalized to the replay shape.
+  assert.deepEqual(result.states, [
+    { entity_id: "sensor.grid_consumption_total", state: "104.5", last_updated_ts: 1770000000 },
+  ]);
 });

@@ -49,7 +49,7 @@ export async function fetchEntityHistory(options) {
   } = options;
   const startISO = new Date(startMs).toISOString();
   const endISO = new Date(endMs).toISOString();
-  const url = `${httpBase.replace(/\/$/, "")}/api/history/period/${startISO}/${endISO}?filter_entity_id=${encodeURIComponent(entityId)}`;
+  const url = `${httpBase.replace(/\/$/, "")}/api/history/period/${startISO}?end_time=${encodeURIComponent(endISO)}&filter_entity_id=${encodeURIComponent(entityId)}`;
   try {
     const res = await fetchFn(url, {
       headers: { Authorization: `Bearer ${token}` },
