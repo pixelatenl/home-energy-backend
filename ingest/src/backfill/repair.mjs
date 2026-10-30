@@ -38,6 +38,10 @@
 // is bounded by the lookback days. dryRun performs detection and fetches but
 // no writes at all. A source that is merely down never confirms inability:
 // its outcome is source-down (retried next run), never permanent.
+// Corroborated entity silence (other configured entities have states in the
+// same range) is confirmed absence of data: the gap range is registered in
+// the permanent-range registry with source 'corroboration', so later runs
+// skip it instead of re-detecting and refetching it forever.
 
 import { BUCKET_MS, DAY_MS, HOUR_MS, dayOf } from "../buckets.mjs";
 import { IngestEngine } from "../engine.mjs";
@@ -307,7 +311,7 @@ async function repairEntity(cfg, c) {
   }
   if (actionable.length === 0) {
     res.outcome = "permanent";
-    res.detail = detailObject(0, 0, 0, permanent, det.reportable.length, false, false);
+    res.detail = detailObject(0, 0, 0, 0, permanent, det.reportable.length, false, false);
     await finish(res, c);
     return res;
   }
@@ -320,6 +324,7 @@ async function repairEntity(cfg, c) {
 
   let repaired = 0;
   let silent = 0;
+  let silentRegistered = 0;
   let down = 0;
   let truncated = false;
   let unattempted = false;
@@ -338,16 +343,48 @@ async function repairEntity(cfg, c) {
       continue;
     }
     const states = hist.states ?? [];
-    const usable = states.filter((s) => Number.isFinite(parseFloat(s.state)));
-    if (usable.length === 0) {
-      // No data for this entity in the range: corroborate (design rule 7).
+    // Only states inside the unpadded gap range classify the gap: the padding
+    // states belong to buckets that already have rows and would make every
+    // silent gap look like data, so corroboration could never fire.
+    const inGap = states.filter((s) => {
+      const ts = Math.round(s.last_updated_ts * 1000);
+      return ts >= g.startMs && ts < g.endMs && Number.isFinite(parseFloat(s.state));
+    });
+    if (inGap.length === 0) {
+      // No numeric states inside the gap: corroborate (design rule 7). If
+      // other configured entities have states in the same range, the
+      // recorder was up and this entity was silent: register the range so
+      // later runs skip it instead of re-detecting and refetching it forever.
       if (await corroboratedSilence(cfg, g, c)) {
         silent += 1;
+        silentRegistered += 1;
+        if (!c.dryRun) {
+          await c.log.markPermanent({
+            haEntityId: cfg.haEntityId,
+            kind: cfg.kind,
+            runKind: c.runKind,
+            source: "corroboration",
+            rangeStartMs: g.startMs,
+            rangeEndMs: g.endMs,
+            rowsMissing: g.missingBuckets,
+            detail: {
+              summary:
+                "corroborated entity silence: no numeric states in the gap, " +
+                "other entities have states; nothing to recover",
+            },
+          });
+        }
       } else {
+        // Not corroborated: the recorder may have been down or have purged
+        // the range. A source outage confirms nothing, so this stays a retry
+        // case (source-down), never permanent (honesty rule 8).
         down += 1;
       }
       continue;
     }
+    // At least one in-gap state: replay everything the recorder saw,
+    // padding included. Writes at padding buckets are no-ops through
+    // ON CONFLICT (their rows already exist).
     const n = Math.min(states.length, c.state.budget);
     c.state.budget -= n;
     if (!c.dryRun) {
@@ -374,7 +411,7 @@ async function repairEntity(cfg, c) {
   } else {
     res.outcome = "no-gap"; // every gap was corroborated entity silence
   }
-  res.detail = detailObject(repaired, silent, down, permanent, det.reportable.length, truncated, unattempted);
+  res.detail = detailObject(repaired, silent, silentRegistered, down, permanent, det.reportable.length, truncated, unattempted);
   await finish(res, c);
   return res;
 }
@@ -770,10 +807,11 @@ function gasDetail(d) {
  * Structured detail for sample/counter runs (JSONB): a human-readable
  * summary field plus the counters of the run.
  */
-function detailObject(repaired, silent, down, permanent, reportable, truncated, unattempted) {
+function detailObject(repaired, silent, silentRegistered, down, permanent, reportable, truncated, unattempted) {
   const parts = [];
   if (repaired > 0) parts.push(`${repaired} gap(s) repaired`);
   if (silent > 0) parts.push(`${silent} silent (corroborated)`);
+  if (silentRegistered > 0) parts.push(`${silentRegistered} silent range(s) registered via corroboration`);
   if (down > 0) parts.push(`${down} source-down`);
   if (permanent > 0) parts.push(`${permanent} gap(s) in permanent range(s)`);
   if (reportable > 0) parts.push(`${reportable} run(s) reportable but not repairable`);
@@ -784,6 +822,7 @@ function detailObject(repaired, silent, down, permanent, reportable, truncated, 
     summary: parts.join(", "),
     gaps_repaired: repaired,
     gaps_silent: silent,
+    gaps_silent_registered: silentRegistered,
     gaps_source_down: down,
     gaps_permanent: permanent,
     runs_reportable: reportable,

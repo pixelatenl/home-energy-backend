@@ -19,7 +19,10 @@
 -- Provenance: run_kind distinguishes timer runs (auto, a later build block)
 -- from manual CLI runs (cli); source records which plugin supplied the rows
 -- (ha-history, zonneplan-forecast and zonneplan-history, none for
--- registry-only rows and the catch-up report rows). 'attribution-suspect' is a report
+-- registry-only rows and the catch-up report rows, and corroboration for
+-- sample/counter gap ranges registered as corroborated entity silence:
+-- confirmed absence of data, which differs from a source outage).
+-- 'attribution-suspect' is a report
 -- value: the class 2 catch-up detection writes it for existing suspect
 -- delta rows found in the lookback window; no data rows are written for it.
 

@@ -58,32 +58,45 @@ again, without ever touching rows that already exist.
    whole run; the run stops mid-way with outcome `partial` and continues on
    the next run. Detection windows are bounded by
    EMS_BACKFILL_LOOKBACK_DAYS (default 7 days).
-7. **No-data corroboration.** An empty history fetch does not by itself mean
-   anything: the entity may have been silent (nothing to repair), or the
-   recorder may have been down or have purged the range (source problem).
-   The repair corroborates: if other configured entities have states in the
-   same range, the recorder was up and the entity was silent (outcome
-   `no-gap`, nothing written); if no configured entity has states there,
-   the recorder was down (outcome `source-down`, retried on the next run).
-   With only one configured entity corroboration is impossible; the run then
-   reports `source-down` (conservative: retry) rather than inventing
-   confidence.
+7. **No-data corroboration.** An empty in-gap history does not by itself
+   mean anything: the entity may have been silent (nothing to repair), or
+   the recorder may have been down or have purged the range (source
+   problem). The classification counts only states inside the unpadded gap
+   range [startMs, endMs): the padding states belong to buckets that
+   already have rows and would make every silent gap look like data. The
+   repair corroborates over the gap range: if other configured entities
+   have states there, the recorder was up and the entity was silent
+   (outcome `no-gap`, nothing written), and the gap range is registered
+   through the permanent-range registry with source `corroboration`, so
+   later runs skip it instead of re-detecting, refetching and relogging it
+   forever (mirroring the price path, where a source confirmed unable to
+   cover hours makes them permanent). Corroboration is confirmed absence
+   of data, which is exactly what the registry is for; it is not a source
+   outage. If no configured entity has states there, the recorder was
+   down (outcome `source-down`, retried on the next run, never permanent:
+   honesty rule 8 is untouched). With only one configured entity
+   corroboration is impossible; the run then reports `source-down`
+   (conservative: retry) rather than inventing confidence.
 8. **Permanent ranges.** Source-down is never permanent: a source that is
    merely down is a retry case, not an unrecoverable one, and every run
    retries it naturally. The retry cost is bounded by design: the lookback
    window (default 7 days) bounds how long any range is re-scanned, and the
    per-run row cap bounds the hourly work. Permanent registration happens
-   only when a source is confirmed unable to cover a range: uncovered price
-   hours and gas days older than the recorder retention window
-   (EMS_BACKFILL_RECORDER_RETENTION_DAYS, default 40, matching the
+   in two confirmed cases: a source confirmed unable to cover a range
+   (uncovered price hours and gas days older than the recorder retention
+   window, EMS_BACKFILL_RECORDER_RETENTION_DAYS, default 40, matching the
    recorder's purge_keep_days), registered only when the fallback history
-   source was consulted and answered (a fetch error confirms nothing). A gap
+   source was consulted and answered (a fetch error confirms nothing);
+   and corroborated entity silence in the sample/counter path (rule 7,
+   source `corroboration`). A gap
    range covered by a row previously marked permanent in `backfill_log`
    (outcome `permanent`) is excluded by detection for price, gas_price and
    bucket kinds (`permanentRanges` overlap lookups; a bucket gap is skipped
-   when a permanent range fully contains it). The sample/counter path never
-   writes permanent rows; the price and gas paths register them only under
-   the confirmed-unable rule above.
+   when a permanent range fully contains it). The price and gas paths
+   register permanent rows only under the confirmed-unable case above; the
+   sample/counter path registers them only for corroborated entity silence
+   (rule 7). A source outage confirms nothing and never makes a range
+   permanent on any path.
 9. **Worker untouched.** The running worker (src/index.mjs) is not modified
    and does not import the backfill modules. The backfill runs as a CLI
    command (detect, repair, report), manually or from a timer/unit that a
