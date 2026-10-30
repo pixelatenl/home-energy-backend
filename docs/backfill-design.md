@@ -107,7 +107,7 @@ them; they describe data, not program failure.
 | `source-down` | The history fetch failed (typed error, Home Assistant unreachable) or returned no states while corroboration says the recorder was down. Retried on the next run. |
 | `permanent` | All repairable gaps are inside ranges previously marked permanent; nothing was attempted. |
 | `no-gap` | Nothing to repair: no repairable gaps detected (silence and slow cadence are not gaps), or every gap was corroborated entity silence (other entities do have states in the range). |
-| `attribution-suspect` | Report only, written by the class 2 catch-up detection of a later block: a gap whose energy cannot be attributed to buckets. No rows are written for it. |
+| `attribution-suspect` | Report only, written by the class 2 catch-up detection (section 7.3): an existing delta row whose energy cannot be attributed to its bucket. No rows are written for it. |
 
 ## 4. Architecture
 
@@ -141,13 +141,16 @@ how the mechanism is verified without touching a production database.
 | ingest/src/backfill/sources/price-forecast.mjs | Zonneplan tariff forecast (`fetchPriceForecast`, `parseForecastHours`): 15-minute blocks averaged into hours, 1e-7 EUR/kWh converted to EUR. Only hours the attribute covers are provided. |
 | ingest/src/backfill/sources/price-history.mjs | price fallback (`fetchTariffHistory`, `hourlyPricesFromStates`): recorder history of the tariff entity, last observation per hour wins. |
 | ingest/src/backfill/sources/gas-price-history.mjs | gas price source (`fetchGasPriceHistory`, `dailyPricesFromStates`, `localDayStartMs`): recorder history of the configured gas price entity, first observation per local day wins. |
-| ingest/src/backfill/repair.mjs | orchestrator `runBackfill` plus the SQL loaders (rows, price hours, gas days). Replay, corroboration, budget, price/gas repair, permanent registration, outcomes. |
+| ingest/src/backfill/repair.mjs | orchestrator `runBackfill` plus the SQL loaders (rows, deltas, price hours, gas days). Replay, corroboration, budget, price/gas repair, permanent registration, catch-up reporting, outcomes. |
+| ingest/src/backfill/catchup.mjs | pure class 2 catch-up detector: `flagAttributionSuspects`, `medianOf`. No I/O. |
 | ingest/src/backfill/writer.mjs | `BackfillWriter`: engine-writer adapter that labels writes with the backfill source and tracks pending inserts. |
 | ingest/src/backfill/log.mjs | `createBackfillLog`: backfill_log inserts, permanent-range registry (mark permanent, is-permanent, permanent ranges), recent rows. |
 | ingest/src/backfill/cli.mjs | commands detect, repair (default), report; flags --kind, --entity, --since, --dry-run, --auto, --limit. |
 | ingest/src/db.mjs | DbWriter with the additive `source` parameter (default `ingest`); write methods return their insert count. |
 | ingest/scripts/verify-backfill.mjs | manual verification script with fake writer, fake fetch and fake log (no database, no Home Assistant). |
 | ingest/test/backfill-detect.test.mjs | unit tests of the pure detectors (node:test). |
+| ingest/test/backfill-catchup.test.mjs | unit tests of the catch-up detector and its read-only integration (node:test). |
+| ingest/test/backfill-honesty.test.mjs | honesty-rule pinning tests, end to end through `runBackfill` with fakes (node:test). |
 | deploy/ems-backfill.service + .timer | oneshot service and hourly timer for the automated repair run. |
 | deploy/migrations/003_backfill_log.sql | idempotent migration creating `backfill_log`. |
 
@@ -288,6 +291,52 @@ runs `cli.mjs repair --auto`: run_kind `auto`, a journal-friendly one-line
 summary per entity, and exit 0 for every data outcome (source-down is
 retried by the next hourly run). See deploy/README.md for installation.
 
+### 7.3 Catch-up detection (class 2): reporting only
+
+A second class of data loss leaves rows present but suspect: a meter that
+was offline for hours reports a cumulative jump on its first reading
+afterwards, and the worker dutifully derives one 5-minute delta that in
+reality contains the energy of the whole offline period. The energy is
+real, but it cannot be attributed to the buckets it belongs to: the row
+is attribution-suspect.
+
+ingest/src/backfill/catchup.mjs holds the pure detector
+`flagAttributionSuspects(deltas, opts)`: a delta row is suspect when
+|delta_kwh| exceeds EMS_BACKFILL_CATCHUP_FACTOR (default 5) times the
+median |delta| of the same entity over the trailing 7 days before the
+row (the row itself is never part of its own median window), with a
+minimum of 5 samples in that window; without enough samples the row is
+never flagged, because no verdict beats a false alarm. The threshold is
+strict (exceeds, not reaches), and a zero median, a week of zero deltas,
+makes every non-zero delta suspect: that is exactly the catch-up pattern.
+The median (not the mean) keeps the verdict robust: one spike in the
+window neither flags its neighbours nor hides the next spike.
+
+Integration: every repair run scans the existing energy_delta rows of
+each configured counter entity. The SQL loader (`createDeltaLoader`)
+fetches [window start minus 7 days, window end) so every row in the
+lookback window has its full median context, and the suspects reported
+are only those inside the lookback window. When suspects are found, the
+run writes one backfill_log row with outcome `attribution-suspect` for
+the entity (source `none`: no plugin supplied rows; rows_written 0;
+rows_missing the number of suspect rows; the suspect rows with their
+median context listed in detail). When there are none, no extra row is
+written: silence is not news. This report row is additive to the
+entity's repair row; it is the only artifact of the class 2 detection.
+The scan is strictly read-only on the data tables:
+
+- no rows are written to energy_delta or anywhere else,
+- no suspect row is modified or deleted,
+- no energy is ever redistributed over the buckets the jump covers.
+
+Estimate rows (spreading a suspect row's energy over the offline
+buckets, clearly labelled as estimates) are a documented future option
+and intentionally not built: an estimate can never be distinguished from
+a measurement after the fact, and the honesty rules forbid presenting it
+as one. Until then the suspect row keeps its energy where the recorder
+saw it, queries that need per-bucket attribution are advised to consult
+backfill_log, and redistribution is out of scope for the mechanism.
+
 ## 8. Schema
 
 `backfill_log` is a plain table (not a hypertable): one row per entity and
@@ -297,8 +346,9 @@ price and gas_price entities have no row in the entity dimension table.
 Provenance is part of every row: `run_kind` distinguishes timer runs
 (`auto`, a later build block) from manual CLI runs (`cli`), and `source`
 records which plugin supplied the rows (`ha-history` today;
-`zonneplan-forecast` and `zonneplan-history` arrive with the later plugins;
-`none` for registry-only rows).
+`zonneplan-forecast` and `zonneplan-history` for the price and gas paths;
+`none` for registry-only rows and for the class 2 catch-up report rows,
+which write no data rows at all).
 
 ```sql
 CREATE TABLE IF NOT EXISTS backfill_log (
@@ -350,6 +400,10 @@ These rules are invariant for every present and future backfill plugin:
 8. A repair run is read-only with respect to live ingestion: it never
    deletes, never updates, and writes only rows the live worker has not
    written (unique indexes decide, not the plugin).
+9. Catch-up deltas are reported, never repaired: an attribution-suspect
+   row keeps its energy, no estimate rows are written, nothing is
+   redistributed; the backfill_log row is the only artifact of the
+   detection (section 7.3).
 
 ## 10. Environment variables and CLI
 
@@ -364,6 +418,7 @@ Secrets and connection details come from the existing ingest/.env
 | EMS_BACKFILL_LOOKBACK_DAYS | 7 | detection window in days (before now) |
 | EMS_BACKFILL_MAX_ROWS_PER_RUN | 5000 | maximum replayed states per repair run |
 | EMS_BACKFILL_MAX_GAP_BUCKETS | 36 | maximum span in buckets of a repairable gap |
+| EMS_BACKFILL_CATCHUP_FACTOR | 5 | class 2 catch-up threshold: a delta row whose \|delta_kwh\| exceeds this factor times the median \|delta\| of the trailing 7 days (minimum 5 samples) is reported attribution-suspect |
 | EMS_BACKFILL_RECORDER_RETENTION_DAYS | 40 | uncovered hours/days older than this window are registered permanent |
 
 ```bash

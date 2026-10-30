@@ -68,6 +68,43 @@ npm start         # start the worker (Ctrl-C shuts it down cleanly)
 - On connection loss or a Home Assistant restart, the worker reconnects with increasing intervals and subscribes again. Before opening the WebSocket it probes Home Assistant's HTTP endpoint with a short timeout, so a container proxy that accepts TCP while Home Assistant is still booting cannot leave the client hanging in the connecting state; the WebSocket connection itself also carries a connect timeout with a safe abort.
 - A production deployment runs the worker as a systemd service (see below); containerization may follow in a later phase.
 
+## Backfill
+
+When the worker was down, the Home Assistant recorder still has the raw
+states. The backfill mechanism detects the missing intervals in the database
+and replays exactly those through the same engine the live worker uses. Run
+it from `ingest/` with the same `.env` as the worker:
+
+```bash
+node src/backfill/cli.mjs detect                      # report gaps only, no writes
+node src/backfill/cli.mjs repair                      # full repair run (default command)
+node src/backfill/cli.mjs repair --entity sensor.grid_consumption_total
+node src/backfill/cli.mjs repair --dry-run            # detect + fetch, no writes at all
+node src/backfill/cli.mjs report --limit 50           # the last backfill_log rows
+```
+
+Flags: `--kind K` (sample | counter | price | gas_price), `--entity ID`,
+`--since ISO` (window start instead of the lookback days), `--auto` (timer
+runs: one journal-friendly line per entity). Exit code 0 covers every data
+outcome (repaired, partial, source-down, permanent, no-gap); non-zero means
+a program error. Tuning knobs: `EMS_BACKFILL_LOOKBACK_DAYS` (7),
+`EMS_BACKFILL_MAX_ROWS_PER_RUN` (5000), `EMS_BACKFILL_MAX_GAP_BUCKETS` (36),
+`EMS_BACKFILL_CATCHUP_FACTOR` (5), `EMS_BACKFILL_RECORDER_RETENTION_DAYS`
+(40); see docs/backfill-design.md for the full design.
+
+Automation: deploy/ems-backfill.timer runs `repair --auto` hourly
+(RandomizedDelaySec 300, Persistent true); install it with the service unit
+as described in deploy/README.md.
+
+Honesty rules: the backfill never fabricates values (only what the recorder
+saw is replayed, silence stays silence), never repairs silently (every run
+writes an auditable backfill_log row with the honest outcome and bookkeeping)
+and never overwrites ingest rows (existing rows always win, all writes are
+ON CONFLICT DO NOTHING, so a repair can only add what the worker never
+wrote). Suspect catch-up deltas (a meter jump after an offline period) are
+reported in backfill_log as `attribution-suspect` and left untouched: no
+estimates, no redistribution.
+
 ## Structure
 
 | File | Contents |
@@ -77,8 +114,9 @@ npm start         # start the worker (Ctrl-C shuts it down cleanly)
 | src/ha-client.mjs | WebSocket client with authentication, HTTP probe and reconnect |
 | src/db.mjs | writes to TimescaleDB (idempotent) |
 | src/buckets.mjs | time intervals (5 minutes, hour, local day) |
+| src/backfill/ | backfill mechanism: gap detection, repair replay, catch-up reporting, CLI (see docs/backfill-design.md) |
 | src/list-entities.mjs | helper script to look up entity ids |
-| test/engine.test.mjs | unit tests (node --test) |
+| test/*.mjs | unit tests, including the backfill honesty pins (node --test) |
 | ems-ingest.service | systemd unit for production (placeholder user) |
 
 ## Running as a systemd service

@@ -18,10 +18,10 @@
 --
 -- Provenance: run_kind distinguishes timer runs (auto, a later build block)
 -- from manual CLI runs (cli); source records which plugin supplied the rows
--- (ha-history today, zonneplan-forecast and zonneplan-history in later
--- blocks, none for registry-only rows). 'attribution-suspect' is a report
--- value: the class 2 catch-up detection of a later block writes it when a
--- gap's energy cannot be attributed to buckets; no rows are written for it.
+-- (ha-history, zonneplan-forecast and zonneplan-history, none for
+-- registry-only rows and the catch-up report rows). 'attribution-suspect' is a report
+-- value: the class 2 catch-up detection writes it for existing suspect
+-- delta rows found in the lookback window; no data rows are written for it.
 
 CREATE TABLE IF NOT EXISTS backfill_log (
     id            BIGSERIAL PRIMARY KEY,

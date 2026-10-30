@@ -17,7 +17,8 @@
 // tuning from the environment (the same ingest/.env as the worker):
 // HA_WS_URL, HA_TOKEN, PG*, EMS_TIMEZONE, EMS_BACKFILL_LOOKBACK_DAYS,
 // EMS_BACKFILL_MAX_ROWS_PER_RUN, EMS_BACKFILL_MAX_GAP_BUCKETS,
-// EMS_BACKFILL_RECORDER_RETENTION_DAYS. No new env files.
+// EMS_BACKFILL_CATCHUP_FACTOR, EMS_BACKFILL_RECORDER_RETENTION_DAYS.
+// No new env files.
 
 import { readFileSync } from "node:fs";
 import pg from "pg";
@@ -31,6 +32,7 @@ import { fetchGasPriceHistory } from "./sources/gas-price-history.mjs";
 import {
   runBackfill,
   createRowLoader,
+  createDeltaLoader,
   createPriceHoursLoader,
   createGasDaysLoader,
 } from "./repair.mjs";
@@ -178,6 +180,7 @@ async function commandRepair(entities, args) {
       lookbackDays: Number(process.env.EMS_BACKFILL_LOOKBACK_DAYS ?? 7) || 7,
       maxRowsPerRun: Number(process.env.EMS_BACKFILL_MAX_ROWS_PER_RUN ?? 5000) || 5000,
       maxGapBuckets: Number(process.env.EMS_BACKFILL_MAX_GAP_BUCKETS ?? 36) || 36,
+      catchupFactor: Number(process.env.EMS_BACKFILL_CATCHUP_FACTOR ?? 5) || 5,
       recorderRetentionDays: Number(process.env.EMS_BACKFILL_RECORDER_RETENTION_DAYS ?? 40) || 40,
       timeZone: process.env.EMS_TIMEZONE ?? "Europe/Amsterdam",
       source: "backfill-ha-history", // row label in energy_delta
@@ -185,6 +188,7 @@ async function commandRepair(entities, args) {
       runKind: args.auto ? "auto" : "cli",
       sinceMs,
       loadRows: createRowLoader(pool, dbWriter.ids),
+      loadDeltas: createDeltaLoader(pool, dbWriter.ids),
       fetchHistory,
       dbWriter,
       log,

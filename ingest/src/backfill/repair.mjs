@@ -22,6 +22,12 @@
 // the recorder history of the configured gas price entity, first observation
 // per local day wins (engine semantics), same permanent/retry rules.
 //
+// Counter entities additionally get the class 2 catch-up scan
+// (section 7.3, catchup.mjs): existing attribution-suspect deltas in the
+// lookback window are reported in backfill_log (outcome
+// 'attribution-suspect'), strictly read-only: no writes to energy_delta,
+// no modification of existing rows, no redistribution.
+//
 // Every path writes exactly one backfill_log row per entity and kind with
 // the outcome and honest bookkeeping (rows_written next to rows_missing),
 // carrying the run provenance (run_kind, source). Everything with a side
@@ -36,6 +42,7 @@
 import { BUCKET_MS, DAY_MS, HOUR_MS, dayOf } from "../buckets.mjs";
 import { IngestEngine } from "../engine.mjs";
 import { detectBucketGaps, detectPriceGaps, detectGasPriceGaps } from "./detect.mjs";
+import { flagAttributionSuspects, CATCHUP_WINDOW_MS, DEFAULT_CATCHUP_FACTOR } from "./catchup.mjs";
 import { BackfillWriter } from "./writer.mjs";
 import { localDayStartMs, nextDay } from "./sources/gas-price-history.mjs";
 
@@ -61,6 +68,28 @@ export function createRowLoader(pool, ids) {
       [id, new Date(fromMs).toISOString(), new Date(toMs).toISOString()]
     );
     return res.rows.map((r) => new Date(r.ts).getTime());
+  };
+}
+
+/**
+ * SQL row loader: the delta rows (ts and delta_kwh) a counter entity already
+ * has in energy_delta. Input for the class 2 catch-up detection: the repair
+ * run scans these rows for attribution-suspect values (report only).
+ *
+ * @param {object} pool - pg.Pool
+ * @param {Map<string, number>} ids - haEntityId -> entity.id (from DbWriter)
+ */
+export function createDeltaLoader(pool, ids) {
+  return async function loadDeltas(cfg, fromMs, toMs) {
+    const id = ids.get(cfg.haEntityId);
+    if (id === undefined) return [];
+    const res = await pool.query(
+      `SELECT ts, delta_kwh FROM energy_delta
+       WHERE entity_id = $1 AND ts >= $2 AND ts < $3
+       ORDER BY ts`,
+      [id, new Date(fromMs).toISOString(), new Date(toMs).toISOString()]
+    );
+    return res.rows.map((r) => ({ tsMs: new Date(r.ts).getTime(), deltaKwh: Number(r.delta_kwh) }));
   };
 }
 
@@ -98,6 +127,9 @@ export function createGasDaysLoader(pool) {
  * @param {number} [options.lookbackDays=7] - EMS_BACKFILL_LOOKBACK_DAYS
  * @param {number} [options.maxRowsPerRun=5000] - EMS_BACKFILL_MAX_ROWS_PER_RUN
  * @param {number} [options.maxGapBuckets=36] - EMS_BACKFILL_MAX_GAP_BUCKETS
+ * @param {number} [options.catchupFactor=5] - EMS_BACKFILL_CATCHUP_FACTOR,
+ *   the class 2 catch-up threshold: |delta_kwh| above this factor times the
+ *   median |delta| of the trailing 7 days flags a row attribution-suspect
  * @param {number} [options.recorderRetentionDays=40] -
  *   EMS_BACKFILL_RECORDER_RETENTION_DAYS; hours/days older than this window
  *   cannot be covered by the recorder and may be registered permanent
@@ -111,6 +143,9 @@ export function createGasDaysLoader(pool) {
  * @param {() => number} [options.now] - injectable clock
  * @param {number|null} [options.sinceMs] - explicit window start (--since)
  * @param {Function} options.loadRows - async (cfg, fromMs, toMs) => number[]
+ * @param {Function} [options.loadDeltas] - async (cfg, fromMs, toMs) =>
+ *   {tsMs, deltaKwh}[]; required for the class 2 catch-up scan of counter
+ *   entities (absent: no scan, no attribution-suspect rows)
  * @param {Function} options.fetchHistory - async (entityId, fromMs, toMs) =>
  *   {states: [{entity_id, state, last_updated_ts}]} | {error: {code, message}}
  * @param {object} options.dbWriter - DbWriter (or fake with the same contract)
@@ -132,6 +167,7 @@ export async function runBackfill(options = {}) {
     lookbackDays = 7,
     maxRowsPerRun = 5000,
     maxGapBuckets = 36,
+    catchupFactor = DEFAULT_CATCHUP_FACTOR,
     recorderRetentionDays = 40,
     timeZone = "Europe/Amsterdam",
     source = "backfill-ha-history",
@@ -140,6 +176,7 @@ export async function runBackfill(options = {}) {
     now = () => Date.now(),
     sinceMs = null,
     loadRows,
+    loadDeltas,
     fetchHistory,
     dbWriter,
     log,
@@ -167,11 +204,18 @@ export async function runBackfill(options = {}) {
   const state = { budget: Math.max(0, maxRowsPerRun) };
   const candidates = entities.filter((e) => e.kind === "sample" || e.kind === "counter");
 
-  const c = { entities, fromMs, toMs, state, loadRows, fetchHistory, dbWriter, log, timeZone, source, logSource, runKind, recorderRetentionDays, maxGapBuckets, loadPriceHours, fetchPriceForecast, fetchPriceHistory, loadGasDays, fetchGasHistory, dryRun };
+  const c = { entities, fromMs, toMs, state, loadRows, loadDeltas, fetchHistory, dbWriter, log, timeZone, source, logSource, runKind, recorderRetentionDays, maxGapBuckets, catchupFactor, loadPriceHours, fetchPriceForecast, fetchPriceHistory, loadGasDays, fetchGasHistory, dryRun };
 
   const results = [];
   for (const cfg of candidates) {
     results.push(await repairEntity(cfg, c));
+    // Class 2 catch-up scan (report only): existing suspect deltas of counter
+    // entities in the lookback window become an attribution-suspect log row.
+    // Strictly read-only on the data tables: no writes, no redistribution.
+    if (cfg.kind === "counter" && typeof c.loadDeltas === "function") {
+      const catchup = await catchupScan(cfg, c);
+      if (catchup !== null) results.push(catchup);
+    }
   }
   // One price pipeline per run: every kind "price" entity shares the same
   // source (the tariff entity) and the same price table, so the first
@@ -331,6 +375,56 @@ async function repairEntity(cfg, c) {
     res.outcome = "no-gap"; // every gap was corroborated entity silence
   }
   res.detail = detailObject(repaired, silent, down, permanent, det.reportable.length, truncated, unattempted);
+  await finish(res, c);
+  return res;
+}
+
+/**
+ * Class 2 catch-up scan of one counter entity (see docs/backfill-design.md,
+ * section 7.3). Loads the entity's delta rows and flags the
+ * attribution-suspect ones among those inside the lookback window. The
+ * median context reaches CATCHUP_WINDOW_MS before the window start; the
+ * suspects themselves are only reported for rows in the window.
+ *
+ * Report only: the result carries outcome 'attribution-suspect', source
+ * 'none' (no plugin supplied rows), rows_written 0 and the suspects in the
+ * structured detail. Nothing is written to energy_delta, no existing row is
+ * modified, no energy is redistributed. Returns null when there is nothing
+ * to report (no extra log row: silence is not news).
+ */
+async function catchupScan(cfg, c) {
+  const deltas = await c.loadDeltas(cfg, c.fromMs - CATCHUP_WINDOW_MS, c.toMs);
+  const suspects = flagAttributionSuspects(deltas, { factor: c.catchupFactor }).filter(
+    (s) => s.tsMs >= c.fromMs && s.tsMs < c.toMs
+  );
+  if (suspects.length === 0) return null;
+
+  const res = {
+    haEntityId: cfg.haEntityId,
+    kind: cfg.kind,
+    runKind: c.runKind,
+    source: "none",
+    outcome: "attribution-suspect",
+    rowsWritten: 0,
+    rowsMissing: suspects.length,
+    statesReplayed: 0,
+    rangeStartMs: suspects[0].tsMs,
+    rangeEndMs: suspects[suspects.length - 1].tsMs + BUCKET_MS,
+    detail: {
+      summary:
+        `${suspects.length} suspect delta row(s): |delta_kwh| above ` +
+        `${c.catchupFactor} x the median |delta| of the trailing 7 days; ` +
+        `report only, no rows written`,
+      suspects: suspects.length,
+      catchup_factor: c.catchupFactor,
+      suspect_rows: suspects.map((s) => ({
+        ts: new Date(s.tsMs).toISOString(),
+        delta_kwh: s.deltaKwh,
+        median_abs_delta: s.medianAbsDelta,
+        window_samples: s.windowSamples,
+      })),
+    },
+  };
   await finish(res, c);
   return res;
 }
