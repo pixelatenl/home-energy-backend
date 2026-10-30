@@ -12,6 +12,13 @@
 //   restarts idempotent (the same value is written again).
 // Note: for gas entities the energy_delta column delta_kwh holds cubic
 // metres (m3); the unit in the entity table determines the interpretation.
+//
+// Backfill support (additive, see docs/backfill-design.md): writeEnergyDelta
+// takes an optional source (default 'ingest', so the worker is unchanged)
+// and every write method returns a promise that resolves to the number of
+// rows actually inserted (0 on conflict or error). The backfill mechanism
+// uses this to label repaired rows 'backfill-ha-history' and to count what
+// a repair run really wrote; the worker ignores the return values.
 
 import pg from "pg";
 
@@ -44,32 +51,40 @@ export class DbWriter {
 
   writeMeasurement(meta, tsMs, value) {
     const id = this.ids.get(meta.haEntityId);
-    if (id === undefined) return;
-    this.pool
+    if (id === undefined) return Promise.resolve(0);
+    return this.pool
       .query(
         `INSERT INTO measurement (entity_id, ts, value)
          VALUES ($1, $2, $3)
          ON CONFLICT DO NOTHING`,
         [id, iso(tsMs), value]
       )
-      .catch((e) => console.error("measurement write error:", e.message));
+      .then((res) => res.rowCount ?? 0)
+      .catch((e) => {
+        console.error("measurement write error:", e.message);
+        return 0;
+      });
   }
 
-  writeEnergyDelta(meta, tsMs, deltaKwh) {
+  writeEnergyDelta(meta, tsMs, deltaKwh, source = "ingest") {
     const id = this.ids.get(meta.haEntityId);
-    if (id === undefined) return;
-    this.pool
+    if (id === undefined) return Promise.resolve(0);
+    return this.pool
       .query(
         `INSERT INTO energy_delta (entity_id, ts, delta_kwh, source)
-         VALUES ($1, $2, $3, 'ingest')
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT DO NOTHING`,
-        [id, iso(tsMs), deltaKwh]
+        [id, iso(tsMs), deltaKwh, source]
       )
-      .catch((e) => console.error("energy_delta write error:", e.message));
+      .then((res) => res.rowCount ?? 0)
+      .catch((e) => {
+        console.error("energy_delta write error:", e.message);
+        return 0;
+      });
   }
 
   writePrice(meta, tsMs, priceEur) {
-    this.pool
+    return this.pool
       .query(
         `INSERT INTO price (ts, tariff, price_eur, source)
          VALUES ($1, 'normaal', $2, $3)
@@ -77,11 +92,15 @@ export class DbWriter {
            SET price_eur = EXCLUDED.price_eur`,
         [iso(tsMs), priceEur, meta.source ?? "zonneplan"]
       )
-      .catch((e) => console.error("price write error:", e.message));
+      .then((res) => res.rowCount ?? 0)
+      .catch((e) => {
+        console.error("price write error:", e.message);
+        return 0;
+      });
   }
 
   writeGasPrice(meta, day, priceEur) {
-    this.pool
+    return this.pool
       .query(
         `INSERT INTO gas_price (day, price_eur_per_m3, source)
          VALUES ($1, $2, $3)
@@ -90,7 +109,11 @@ export class DbWriter {
                source = EXCLUDED.source`,
         [day, priceEur, meta.source ?? "zonneplan"]
       )
-      .catch((e) => console.error("gas_price write error:", e.message));
+      .then((res) => res.rowCount ?? 0)
+      .catch((e) => {
+        console.error("gas_price write error:", e.message);
+        return 0;
+      });
   }
 
   async close() {
