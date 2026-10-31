@@ -14,7 +14,10 @@
 
 set -Eeuo pipefail
 
-REHEARSAL_IMAGE="timescale/timescaledb:latest-pg16"
+DB_CONTAINER="ems-timescaledb"
+# Fallback only: the rehearsal image is pinned at runtime to the exact image
+# the live database container runs, so the restore never needs a network pull.
+DEFAULT_REHEARSAL_IMAGE="timescale/timescaledb:latest-pg16"
 DB_USER="ems"
 DB_NAME="energy"
 
@@ -49,6 +52,25 @@ TARGET_DIR="${TARGET_DIR%/}"
 case "$(cd -- "$TARGET_DIR" 2>/dev/null && pwd)" in
     /|/home|/Users|/tmp) die "refusing to use '$TARGET_DIR' as target" ;;
 esac
+
+# Pin the rehearsal image to the live container's image (running or stopped);
+# fall back to the configured tag only when the container no longer exists.
+# Either way the image is already on the local docker host: never a pull.
+REHEARSAL_IMAGE="$(docker inspect -f '{{.Image}}' "$DB_CONTAINER" 2>/dev/null || true)"
+if [ -n "$REHEARSAL_IMAGE" ]; then
+    echo "restore: rehearsal image pinned to live container image ($REHEARSAL_IMAGE)"
+else
+    REHEARSAL_IMAGE="$DEFAULT_REHEARSAL_IMAGE"
+    echo "restore: container $DB_CONTAINER not found, using configured image $REHEARSAL_IMAGE"
+fi
+
+# Guard: one restore into this target directory at a time.
+mkdir -p -- "$(dirname -- "$TARGET_DIR")"
+LOCK_FILE="$TARGET_DIR.restore.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    die "another restore into '$TARGET_DIR' is already in progress ($LOCK_FILE)"
+fi
 
 if [ -d "$TARGET_DIR" ] && [ -n "$(ls -A -- "$TARGET_DIR" 2>/dev/null)" ]; then
     if [ "$FORCE" -eq 1 ]; then

@@ -10,8 +10,9 @@
 # Chain per run:
 #   1. pg_basebackup inside the live container (local socket, no network).
 #   2. Stream out, gzip -9, integrity check (gzip -t).
-#   3. Restore rehearsal: boot the archive in a scratch container and compare
-#      row counts against the live database. Any mismatch fails the run.
+#   3. Restore rehearsal: boot the archive in a scratch container and check
+#      the row counts of every table against live bounds (see below). Any
+#      violation fails the run.
 #   4. Only then promote the archive to daily/weekly/monthly/last + retention.
 #
 # A failed run leaves no staging artifacts behind and never touches existing
@@ -42,7 +43,6 @@ KEEP_MONTHLY=6
 
 STAGING_DIR="/tmp/ems-basebackup"  # staging dir inside the DB container
 REHEARSAL_CONTAINER="ems-backup-rehearsal"
-REHEARSAL_IMAGE="timescale/timescaledb:latest-pg16"
 REHEARSAL_STARTUP_TIMEOUT=120      # seconds to wait for pg_isready
 
 # ---------------------------------------------------------------------------
@@ -139,17 +139,47 @@ prune() {
 }
 
 # ---------------------------------------------------------------------------
+# Lock guard: one backup run at a time (the rehearsal can take a while).
+# ---------------------------------------------------------------------------
+mkdir -p -- "$BACKUP_DIR"
+LOCK_FILE="$BACKUP_DIR/.backup.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    die "another backup run is already in progress ($LOCK_FILE)"
+fi
+
+# ---------------------------------------------------------------------------
 # Preflight.
 # ---------------------------------------------------------------------------
 log "backup: run started"
 [ "$(docker inspect -f '{{.State.Running}}' "$DB_CONTAINER" 2>/dev/null || true)" = "true" ] \
     || die "preflight: container $DB_CONTAINER is not running"
 
+# Pin the rehearsal to the exact image the live database runs, so the scratch
+# container starts from what is already on the local docker host (never pulls).
+REHEARSAL_IMAGE="$(docker inspect -f '{{.Image}}' "$DB_CONTAINER")"
+log "backup: rehearsal image pinned to live container image ($REHEARSAL_IMAGE)"
+
 mkdir -p -- "$DAILY_PATH" "$WEEKLY_PATH" "$MONTHLY_PATH" "$LAST_PATH"
 
 # ---------------------------------------------------------------------------
 # 1. Physical base backup inside the live container (local socket only).
 # ---------------------------------------------------------------------------
+# Why a bounds check and not an equality check against one live snapshot: the
+# rehearsal database reflects a consistent point in time somewhere between the
+# PRE snapshot (taken before pg_basebackup started) and the POST snapshot
+# (taken right after it returned). Ingest into these tables is append-only
+# (the backfill repair only inserts, it never deletes), so any live snapshot
+# taken during the backup window can only be between the two bounds. A single
+# equality comparison against a live count taken at a different instant would
+# spuriously fail whenever ingest committed a row during the backup.
+declare -A PRE_COUNTS POST_COUNTS REHEARSAL_COUNTS
+
+log "backup: taking pre-backup row counts"
+PRE_OUT="$(row_counts "$DB_CONTAINER")"
+parse_counts "$PRE_OUT" PRE_COUNTS
+log "backup: pre-backup row counts: $PRE_OUT"
+
 log "backup: removing previous staging dir $STAGING_DIR in $DB_CONTAINER"
 docker exec "$DB_CONTAINER" rm -rf "$STAGING_DIR"
 
@@ -157,13 +187,10 @@ log "backup: running pg_basebackup inside $DB_CONTAINER"
 docker exec "$DB_CONTAINER" pg_basebackup \
     -U "$DB_USER" -D "$STAGING_DIR" -Fp -Xs --checkpoint=fast
 
-# Snapshot the live row counts right after the backup finished; the rehearsal
-# database will reflect exactly this point in time.
-declare -A LIVE_COUNTS REHEARSAL_COUNTS
-
-LIVE_OUT="$(row_counts "$DB_CONTAINER")"
-parse_counts "$LIVE_OUT" LIVE_COUNTS
-log "backup: live row counts: $LIVE_OUT"
+log "backup: taking post-backup row counts"
+POST_OUT="$(row_counts "$DB_CONTAINER")"
+parse_counts "$POST_OUT" POST_COUNTS
+log "backup: post-backup row counts: $POST_OUT"
 
 # ---------------------------------------------------------------------------
 # 2. Stream the result out and compress on the host.
@@ -184,7 +211,8 @@ log "backup: archive size $(size_of "$TMP_ARCHIVE") bytes"
 # ---------------------------------------------------------------------------
 # 4. Restore rehearsal in a scratch container.
 # ---------------------------------------------------------------------------
-REHEARSAL_STAGE="$(mktemp -d "$BACKUP_DIR/.rehearsal.XXXXXX")"
+# Absolute on purpose: docker -v bind mounts must not get a relative path.
+REHEARSAL_STAGE="$(mktemp -d "$SCRIPT_DIR/$BACKUP_DIR/.rehearsal.XXXXXX")"
 log "rehearsal: extracting archive to $REHEARSAL_STAGE"
 tar -xzf "$TMP_ARCHIVE" -C "$REHEARSAL_STAGE"
 
@@ -218,16 +246,27 @@ parse_counts "$REHEARSAL_OUT" REHEARSAL_COUNTS
 
 REHEARSAL_OK=1
 for table in "${DB_TABLES[@]}"; do
-    live_count="${LIVE_COUNTS[$table]:-}"
-    rehearsal_count="${REHEARSAL_COUNTS[$table]:-}"
-    if [ -n "$live_count" ] && [ "$live_count" = "$rehearsal_count" ]; then
-        log "rehearsal: $table OK ($live_count rows)"
+    pre="${PRE_COUNTS[$table]:-}"
+    post="${POST_COUNTS[$table]:-}"
+    rehearsal="${REHEARSAL_COUNTS[$table]:-}"
+    if [ -z "$pre" ] || [ -z "$post" ] || [ -z "$rehearsal" ]; then
+        log "rehearsal: $table MISMATCH (missing count: pre '$pre' rehearsal '$rehearsal' post '$post')"
+        REHEARSAL_OK=0
+        continue
+    fi
+    log "rehearsal: $table pre=$pre rehearsal=$rehearsal post=$post"
+    if (( pre <= rehearsal && rehearsal <= post )); then
+        if [ "$pre" -eq "$rehearsal" ] && [ "$rehearsal" -eq "$post" ]; then
+            log "rehearsal: $table OK (clean case: pre == rehearsal == post)"
+        else
+            log "rehearsal: $table OK (rehearsal within live bounds)"
+        fi
     else
-        log "rehearsal: $table MISMATCH (live '$live_count' vs rehearsal '$rehearsal_count')"
+        log "rehearsal: $table MISMATCH (outside live bounds, expected pre <= rehearsal <= post)"
         REHEARSAL_OK=0
     fi
 done
-[ "$REHEARSAL_OK" -eq 1 ] || die "rehearsal: row counts do not match the live database"
+[ "$REHEARSAL_OK" -eq 1 ] || die "rehearsal: row counts do not match the live database bounds"
 
 docker rm -f "$REHEARSAL_CONTAINER" >/dev/null
 rm -rf -- "$REHEARSAL_STAGE"
