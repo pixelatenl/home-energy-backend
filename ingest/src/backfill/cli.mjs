@@ -23,7 +23,7 @@
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { DbWriter } from "../db.mjs";
-import { DAY_MS, dayOf } from "../buckets.mjs";
+import { DAY_MS, dayOf, hourOf } from "../buckets.mjs";
 import { detectBucketGaps, detectPriceGaps, detectGasPriceGaps } from "./detect.mjs";
 import { fetchEntityHistory, haHttpBaseFromWsUrl } from "./sources/ha-history.mjs";
 import { fetchPriceForecast, TARIFF_FORECAST_ENTITY_ID } from "./sources/price-forecast.mjs";
@@ -134,8 +134,10 @@ async function commandDetect(entities, args) {
         }));
       } else if (e.kind === "price") {
         const res = await pool.query(
+          // Aligned like repairPriceEntity: the detector walks the hour grid
+          // from hourOf(fromMs), so the loader's lower bound must match.
           `SELECT ts FROM price WHERE ts >= $1 AND ts < $2 ORDER BY ts`,
-          [iso(fromMs), iso(toMs)]
+          [iso(hourOf(fromMs)), iso(toMs)]
         );
         const hours = res.rows.map((r) => new Date(r.ts).getTime());
         const runs = detectPriceGaps(hours, fromMs, toMs);

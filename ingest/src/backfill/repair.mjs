@@ -43,7 +43,7 @@
 // the permanent-range registry with source 'corroboration', so later runs
 // skip it instead of re-detecting and refetching it forever.
 
-import { BUCKET_MS, DAY_MS, HOUR_MS, dayOf } from "../buckets.mjs";
+import { BUCKET_MS, DAY_MS, HOUR_MS, dayOf, hourOf } from "../buckets.mjs";
 import { IngestEngine } from "../engine.mjs";
 import { detectBucketGaps, detectPriceGaps, detectGasPriceGaps } from "./detect.mjs";
 import { flagAttributionSuspects, CATCHUP_WINDOW_MS, DEFAULT_CATCHUP_FACTOR } from "./catchup.mjs";
@@ -536,8 +536,13 @@ async function registerPermanentRanges(c, { haEntityId, kind, ranges, detail }) 
  * permanent once they are older than the recorder retention window.
  */
 async function repairPriceEntity(cfg, c) {
-  const existing = await c.loadPriceHours(c.fromMs, c.toMs);
-  const runs = detectPriceGaps(existing, c.fromMs, c.toMs);
+  // The loader SQL filters ts >= fromMs while the detector walks the hour
+  // grid from hourOf(fromMs); unaligned timer windows (every --auto run)
+  // made the first hour's row invisible to the loader and phantom-repaired
+  // on every run. Align the window bottom once, use it everywhere.
+  const fromH = hourOf(c.fromMs);
+  const existing = await c.loadPriceHours(fromH, c.toMs);
+  const runs = detectPriceGaps(existing, fromH, c.toMs);
   const detectedHours = [];
   for (const r of runs) {
     for (let t = r.startMs; t < r.endMs; t += HOUR_MS) detectedHours.push(t);
@@ -570,7 +575,7 @@ async function repairPriceEntity(cfg, c) {
 
   // Permanent exclusion: an hour is excluded when a permanent range fully
   // covers it (the registered ranges are hour-aligned).
-  const perm = await c.log.permanentRanges(cfg.haEntityId, "price", c.fromMs, c.toMs);
+  const perm = await c.log.permanentRanges(cfg.haEntityId, "price", fromH, c.toMs);
   const hourInPermanent = (h) => perm.some((r) => r.startMs <= h && r.endMs >= h + HOUR_MS);
   const missingHours = detectedHours.filter((h) => !hourInPermanent(h));
   d.inPermanent = detectedHours.length - missingHours.length;

@@ -8,6 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runBackfill, createGasDaysLoader } from "../src/backfill/repair.mjs";
+import { hourOf } from "../src/buckets.mjs";
 
 const BUCKET = 5 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
@@ -363,6 +364,138 @@ test("price repair end to end: uncovered hours older than the recorder retention
   assert.equal(r2.rowsWritten, 0);
   assert.equal(forecastCalls, 1, "the permanent range stops the re-scan");
   assert.equal(historyCalls, 1, "the permanent range stops the re-scan");
+});
+
+// ---------------------------------------------------------------------------
+// Price window alignment: the timer runs with an unaligned window bottom
+// (now - lookbackDays), the detector walks the hour grid from hourOf(fromMs).
+// These tests pin that the loader, the detector and the permanent-range query
+// all see the same aligned window (regression: the phantom repair).
+
+const UNALIGNED_NOW = Date.parse("2026-10-30T21:02:15.000Z");
+const LOOKBACK_DAYS = 7;
+const unalignedFromMs = UNALIGNED_NOW - LOOKBACK_DAYS * 24 * HOUR;
+
+/**
+ * Faithful fake of the real SQL loader: the full hour grid of the window,
+ * filtered by the raw lower bound (ts >= from AND ts < to) exactly like
+ * `SELECT ts FROM price WHERE ts >= $1 AND ts < $2`.
+ */
+function fakeSqlPriceHours(dropFromGrid = []) {
+  return async (fromMs, toMs) => {
+    const hours = [];
+    for (let t = hourOf(fromMs); t < hourOf(toMs); t += HOUR) {
+      if (dropFromGrid.includes(t)) continue;
+      if (t >= fromMs && t < toMs) hours.push(t);
+    }
+    return hours;
+  };
+}
+
+/** Run the price pipeline with the faithful loader and stubbed sources. */
+async function runUnalignedPrice({ loadPriceHours, db, log }) {
+  let historyCalls = 0;
+  const { results } = await runBackfill({
+    entities: [priceEntity],
+    lookbackDays: LOOKBACK_DAYS,
+    now: () => UNALIGNED_NOW, // unaligned instant, like every --auto timer run
+    ...unusedStubs,
+    loadPriceHours,
+    fetchPriceForecast: async () => ({ hours: [] }),
+    fetchPriceHistory: async (fromMs, toMs) => {
+      historyCalls += 1;
+      return { hours: [{ startMs: hourOf(fromMs), priceEur: 0.42 }] };
+    },
+    dbWriter: db,
+    log,
+  });
+  return { results, historyCalls };
+}
+
+test("price repair: unaligned timer window is not phantom-repaired (no-gap, nothing fetched, nothing written)", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  const writeCalls = [];
+  const recordingDb = {
+    ...db,
+    writePrice: (meta, tsMs, priceEur) => {
+      writeCalls.push(tsMs);
+      return db.writePrice(meta, tsMs, priceEur);
+    },
+  };
+
+  // The database holds every hour of the window: the first grid hour lies
+  // below the raw window start, exactly like the real table after a healthy
+  // run. Before the alignment fix this hour was invisible to the loader,
+  // detected as missing and rewritten from history on every timer run.
+  const { results, historyCalls } = await runUnalignedPrice({
+    loadPriceHours: fakeSqlPriceHours(),
+    db: recordingDb,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.kind, "price");
+  assert.equal(r.outcome, "no-gap", "a complete window is a no-gap, not a repair");
+  assert.equal(r.rowsWritten, 0);
+  assert.equal(r.rowsMissing, 0);
+  assert.equal(historyCalls, 0, "no gap means no history fetch");
+  assert.equal(writeCalls.length, 0, "no existing row is rewritten");
+  assert.equal(log.rows[0].outcome, "no-gap", "the audit row stops lying");
+  assert.equal(log.rows[0].rowsWritten, 0);
+  assert.equal(log.rows[0].rowsMissing, 0);
+});
+
+test("price repair: unaligned window keeps detecting genuinely missing hours mid-grid", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  // Drop one hour in the middle of the grid: still a real gap.
+  const fromH = hourOf(unalignedFromMs);
+  const toH = hourOf(UNALIGNED_NOW);
+  const dropped = fromH + Math.floor((toH - fromH) / (2 * HOUR)) * HOUR;
+
+  const { results, historyCalls } = await runUnalignedPrice({
+    loadPriceHours: fakeSqlPriceHours([dropped]),
+    db,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.outcome, "repaired");
+  assert.equal(r.rowsWritten, 1, "exactly the dropped hour is written");
+  assert.equal(r.rowsMissing, 0);
+  assert.equal(r.rangeStartMs, dropped, "the detected range is the dropped hour");
+  assert.equal(r.rangeEndMs, dropped + HOUR);
+  assert.equal(historyCalls, 1, "the fallback was fetched for the real gap");
+  assert.equal(db.prices.size, 1);
+  assert.equal(db.prices.get(priceEntity.haEntityId + "@" + dropped).price, 0.42);
+  assert.equal(db.prices.get(priceEntity.haEntityId + "@" + dropped).source, "zonneplan-backfill");
+});
+
+test("price repair: alignment must not blind the detector to the window's first hour", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  // The grid genuinely starts one hour late: the first grid hour is absent
+  // from the table and must still be detected and written.
+  const fromH = hourOf(unalignedFromMs);
+  const firstHour = fromH;
+  const faithfulButLate = async (fromMs, toMs) => {
+    const hours = await fakeSqlPriceHours()(fromMs, toMs);
+    return hours.filter((h) => h !== firstHour);
+  };
+
+  const { results } = await runUnalignedPrice({
+    loadPriceHours: faithfulButLate,
+    db,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.outcome, "repaired", "the genuinely missing first hour is repaired");
+  assert.equal(r.rowsWritten, 1);
+  assert.equal(r.rangeStartMs, firstHour, "the first grid hour is the detected gap");
+  assert.equal(db.prices.size, 1);
+  assert.equal(db.prices.has(priceEntity.haEntityId + "@" + firstHour), true);
 });
 
 // ---------------------------------------------------------------------------
