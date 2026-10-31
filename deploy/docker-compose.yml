@@ -22,23 +22,3 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  # Nightly backup outside the database volume: 14 daily and 8 weekly dumps.
-  db-backup:
-    image: prodrigestivill/postgres-backup-local
-    container_name: ems-db-backup
-    environment:
-      POSTGRES_HOST: timescaledb
-      POSTGRES_USER: ems
-      POSTGRES_PASSWORD: "${EMS_DB_PASSWORD}"
-      POSTGRES_DB: energy
-      POSTGRES_EXTRA_OPTS: "-Z9"
-      SCHEDULE: "@daily"
-      BACKUP_KEEP_DAYS: 14
-      BACKUP_KEEP_WEEKS: 8
-    volumes:
-      - ./backups:/backups
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-    restart: unless-stopped
