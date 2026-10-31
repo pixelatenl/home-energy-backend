@@ -43,6 +43,9 @@ KEEP_MONTHLY=6
 
 STAGING_DIR="/tmp/ems-basebackup"  # staging dir inside the DB container
 REHEARSAL_CONTAINER="ems-backup-rehearsal"
+# Fallback for the trap, which can fire before the live container's image has
+# been pinned into REHEARSAL_IMAGE.
+DEFAULT_REHEARSAL_IMAGE="timescale/timescaledb:latest-pg16"
 REHEARSAL_STARTUP_TIMEOUT=120      # seconds to wait for pg_isready
 
 # ---------------------------------------------------------------------------
@@ -64,8 +67,8 @@ log() {
     line="$(date '+%Y-%m-%dT%H:%M:%S%z') $*"
     line="${line//$'\n'/; }"
     echo "$line"
-    mkdir -p -- "$BACKUP_DIR"
-    echo "$line" >> "$LOG_FILE"
+    mkdir -p -- "$BACKUP_DIR" 2>/dev/null || true
+    echo "$line" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 size_of() {
@@ -78,21 +81,42 @@ die() {
     exit 1
 }
 
+remove_staging() {
+    # The extracted staging tree is owned by the container's postgres uid, so
+    # the host user may not be able to remove it; remove it as root inside a
+    # one-shot container instead.
+    if [ -z "$REHEARSAL_STAGE" ] || [ ! -e "$REHEARSAL_STAGE" ]; then
+        return 0
+    fi
+    local image="${REHEARSAL_IMAGE:-$DEFAULT_REHEARSAL_IMAGE}"
+    docker run --rm \
+        -v "$(dirname -- "$REHEARSAL_STAGE")":/cleanup-host \
+        "$image" rm -rf "/cleanup-host/$(basename -- "$REHEARSAL_STAGE")"
+}
+
 # shellcheck disable=SC2329  # invoked via the EXIT trap
 cleanup() {
     # Teardown must be unconditional and tolerant: it runs on success and on
     # every failure path (including a dead DB container).
     docker rm -f "$REHEARSAL_CONTAINER" >/dev/null 2>&1 || true
     docker exec "$DB_CONTAINER" rm -rf "$STAGING_DIR" >/dev/null 2>&1 || true
-    if [ -n "$REHEARSAL_STAGE" ] && [ -d "$REHEARSAL_STAGE" ]; then
-        rm -rf -- "$REHEARSAL_STAGE" || true
-    fi
+    remove_staging >/dev/null 2>&1 || true
     if [ -n "$TMP_ARCHIVE" ] && [ -e "$TMP_ARCHIVE" ]; then
         rm -f -- "$TMP_ARCHIVE" || true
     fi
     return 0
 }
 trap cleanup EXIT
+
+# Every abort path must leave a verdict in backup.log: an unexpected set -e
+# failure lands here instead of exiting silently with no FAILED line.
+# shellcheck disable=SC2329  # invoked via the ERR trap
+on_error() {
+    local rc=$?
+    log "FAILED: unexpected error (exit $rc) near line ${BASH_LINENO[0]:-$LINENO}"
+    exit 1
+}
+trap on_error ERR
 
 # Single query so all live counts come from one snapshot; captured immediately
 # after pg_basebackup returns to keep the live-vs-rehearsal race minimal.
@@ -269,7 +293,13 @@ done
 [ "$REHEARSAL_OK" -eq 1 ] || die "rehearsal: row counts do not match the live database bounds"
 
 docker rm -f "$REHEARSAL_CONTAINER" >/dev/null
-rm -rf -- "$REHEARSAL_STAGE"
+
+log "rehearsal: removing staging dir $REHEARSAL_STAGE"
+if ! remove_staging; then
+    stage="$REHEARSAL_STAGE"
+    REHEARSAL_STAGE=""
+    die "staging cleanup: could not remove $stage"
+fi
 REHEARSAL_STAGE=""
 
 # ---------------------------------------------------------------------------
