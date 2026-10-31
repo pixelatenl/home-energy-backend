@@ -1,0 +1,14 @@
+[Unit]
+Description=Home energy nightly base backup with restore rehearsal (one run, started by the 02:30 timer)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust the user name and the paths to your setup (like ems-ingest.service).
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/home-energy-backend/deploy
+# Physical pg_basebackup chain: base backup, gzip integrity gate, restore
+# rehearsal with row-count comparison, then promotion to the retention tree.
+# Fails (nonzero exit) on any mismatch so the timer run shows up in the journal.
+ExecStart=/home/YOUR_USER/home-energy-backend/deploy/backup.sh
