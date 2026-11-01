@@ -12,6 +12,13 @@
 // upserts on every state change, so the last change of the hour is the
 // stored price).
 //
+// The HA history API answers with one synthetic state beyond the recorded
+// ones: the state current at the requested start, clamped to exactly the
+// start instant — for an hour repair that is the previous hour's price
+// stamped at the missing hour's boundary. The fetch asks HA to skip the
+// initial state, so only genuine in-range observations may produce a price
+// hour (the same defense as the gas price source).
+//
 // Fail-soft: fetch errors return a typed {error} object, never throw past
 // the plugin boundary.
 
@@ -55,7 +62,9 @@ export function hourlyPricesFromStates(states) {
  *   {error: {code: string, message: string}}>} never throws
  */
 export async function fetchPriceEntityHistory(options) {
-  const result = await fetchEntityHistory(options);
+  // skipInitialState: the clamped start-of-period state (the previous hour's
+  // price at the hour boundary) must never fill an hour with no observation.
+  const result = await fetchEntityHistory({ ...options, skipInitialState: true });
   if (result.error) return result;
   return { hours: hourlyPricesFromStates(result.states) };
 }

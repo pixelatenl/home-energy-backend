@@ -8,6 +8,15 @@
 // corrupt the day price, and an evening pre-publication of the next day's
 // price belongs to the evening's day, never to the current day's price.
 //
+// The HA history API answers with one synthetic state beyond the recorded
+// ones: the state current at the requested start, clamped to exactly the
+// start instant. A repair fetch starts at the missing day's local midnight,
+// so that synthetic state is the PREVIOUS day's price stamped at the new
+// day's midnight; with first-observation-per-day semantics it would win the
+// new day hours before the real price publishes (the 31 October 2026
+// midnight phantom). The fetch therefore asks HA to skip the initial state,
+// so only genuine in-range observations may produce a day price.
+//
 // The entity id comes from the configuration (kind gas_price); it is not
 // hardcoded a second time here. Fail-soft: fetch errors return a typed
 // {error} object, never throw past the plugin boundary.
@@ -108,7 +117,9 @@ export function dailyPricesFromStates(states, timeZone = "Europe/Amsterdam") {
  */
 export async function fetchGasPriceHistory(options) {
   const { timeZone = "Europe/Amsterdam", ...fetchOptions } = options;
-  const result = await fetchEntityHistory(fetchOptions);
+  // skipInitialState: the clamped start-of-period state (the previous day's
+  // price at local midnight) must never become the new day's price.
+  const result = await fetchEntityHistory({ ...fetchOptions, skipInitialState: true });
   if (result.error) return result;
   return { days: dailyPricesFromStates(result.states, timeZone) };
 }

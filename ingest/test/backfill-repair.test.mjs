@@ -8,6 +8,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { runBackfill, createGasDaysLoader } from "../src/backfill/repair.mjs";
+import { fetchGasPriceHistory } from "../src/backfill/sources/gas-price-history.mjs";
+import { fetchPriceEntityHistory } from "../src/backfill/sources/price-history.mjs";
+import { faithfulHaHistoryFetchFn } from "./helpers/faithful-ha.mjs";
 import { hourOf } from "../src/buckets.mjs";
 
 const BUCKET = 5 * 60 * 1000;
@@ -607,4 +610,151 @@ test("gas days loader: the day is selected as text, so the rows are YYYY-MM-DD s
   assert.deepEqual(queries[0].params, ["2026-10-20", "2026-10-23"]);
   assert.deepEqual(days, ["2026-10-21", "2026-10-22"]);
   assert.ok(days.every((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)), "YYYY-MM-DD, not a Date string");
+});
+
+// ---------------------------------------------------------------------------
+// Regression pins for the HA history API's synthetic start-of-period state.
+// The faithful fake in helpers/faithful-ha.mjs emulates the API contract: one
+// synthetic state clamped to exactly the requested start (carrying the
+// pre-window value) unless the request URL carries skip_initial_state.
+
+test("regression: the clamped start state must not become the midnight price of an in-progress day", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  const tz = "Europe/Amsterdam";
+  // 00:30 local on 31 October 2026 (CET): the new day's gas price has not
+  // published yet (weekday publication is ~03:15 local), so 31 October is
+  // honestly missing and must be retried, not filled.
+  const from = Date.parse("2026-10-29T00:00:00Z"); // 02:00 local on 29 October
+  const to = Date.parse("2026-10-30T23:30:00Z"); // 00:30 local on 31 October
+  // The recorded timeline: 30 October's price, published 03:15 local (01:15Z,
+  // CEST). Nothing after: no observation for 31 October exists yet.
+  const fetchFn = faithfulHaHistoryFetchFn({
+    states: [{ ms: Date.parse("2026-10-30T01:15:00Z"), state: "1.9830135" }],
+  });
+
+  const { results } = await runBackfill({
+    entities: [gasPriceEntity],
+    sinceMs: from,
+    now: () => to,
+    timeZone: tz,
+    ...unusedStubs,
+    loadGasDays: async () => ["2026-10-29", "2026-10-30"],
+    fetchGasHistory: (cfg, startMs, endMs) =>
+      fetchGasPriceHistory({
+        httpBase: "http://localhost:8123",
+        token: "secret",
+        entityId: cfg.haEntityId,
+        startMs,
+        endMs,
+        timeZone: tz,
+        fetchFn,
+      }),
+    dbWriter: db,
+    log,
+  });
+
+  const r = results[0];
+  // Without skip_initial_state the fake (like real HA) returns 30 October's
+  // price clamped to local midnight of 31 October, and first-observation-per-
+  // day semantics would write it as the new day's price hours early.
+  assert.equal(r.outcome, "partial", "the unpublished day stays uncovered and recent");
+  assert.equal(r.rowsWritten, 0, "the clamped previous day's state produces no day price");
+  assert.equal(r.rowsMissing, 1);
+  assert.equal(db.gasDays.size, 0, "nothing is written");
+  assert.equal(log.permanent.length, 0, "the day is recent: retried, never permanent");
+  assert.equal(log.rows[0].detail.days_from_history, 0);
+});
+
+test("regression: a missing day with a genuine in-range observation yields the real price", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  const tz = "Europe/Amsterdam";
+  // 07:00 local on 31 October 2026 (CET): the day's price published at 03:15
+  // local (02:15Z). 31 October is missing and must be recovered with the
+  // genuine value, not the previous day's clamped state.
+  const from = Date.parse("2026-10-30T00:00:00Z");
+  const to = Date.parse("2026-10-31T06:00:00Z");
+  const fetchFn = faithfulHaHistoryFetchFn({
+    states: [
+      { ms: Date.parse("2026-10-30T01:15:00Z"), state: "1.9830135" }, // 30 October, 03:15 local
+      { ms: Date.parse("2026-10-31T02:15:00Z"), state: "2.0432654" }, // 31 October, 03:15 local
+    ],
+  });
+
+  const { results } = await runBackfill({
+    entities: [gasPriceEntity],
+    sinceMs: from,
+    now: () => to,
+    timeZone: tz,
+    ...unusedStubs,
+    loadGasDays: async () => ["2026-10-30"],
+    fetchGasHistory: (cfg, startMs, endMs) =>
+      fetchGasPriceHistory({
+        httpBase: "http://localhost:8123",
+        token: "secret",
+        entityId: cfg.haEntityId,
+        startMs,
+        endMs,
+        timeZone: tz,
+        fetchFn,
+      }),
+    dbWriter: db,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.outcome, "repaired");
+  assert.equal(r.rowsWritten, 1);
+  assert.deepEqual(
+    { price: db.gasDays.get("2026-10-31").price, source: db.gasDays.get("2026-10-31").source },
+    { price: 2.0432654, source: "zonneplan-backfill" },
+    "the genuine 03:15 observation wins, not 30 October's clamped 1.9830135"
+  );
+});
+
+test("regression: a missing hour with a genuine ~:13 observation yields that hour", async () => {
+  const db = new FakeDb();
+  const log = new FakeLog();
+  const missing = Date.parse("2026-02-10T15:00:00Z");
+  // Recorded timeline: the previous hour's price at 14:13Z and the missing
+  // hour's genuine observation at 15:13Z (the real entity publishes ~13
+  // minutes past the boundary).
+  const fetchFn = faithfulHaHistoryFetchFn({
+    states: [
+      { ms: Date.parse("2026-02-10T14:13:00Z"), state: "0.19" },
+      { ms: Date.parse("2026-02-10T15:13:00Z"), state: "0.21" },
+    ],
+  });
+
+  const { results } = await runBackfill({
+    entities: [priceEntity],
+    sinceMs: Date.parse("2026-02-10T12:00:00Z"),
+    now: () => Date.parse("2026-02-10T17:00:00Z"),
+    ...unusedStubs,
+    loadPriceHours: async () => [
+      Date.parse("2026-02-10T12:00:00Z"),
+      Date.parse("2026-02-10T13:00:00Z"),
+      Date.parse("2026-02-10T14:00:00Z"),
+      Date.parse("2026-02-10T16:00:00Z"),
+    ],
+    fetchPriceForecast: async () => ({ hours: [] }),
+    fetchPriceHistory: (startMs, endMs) =>
+      fetchPriceEntityHistory({
+        httpBase: "http://localhost:8123",
+        token: "secret",
+        entityId: priceEntity.haEntityId,
+        startMs,
+        endMs,
+        fetchFn,
+      }),
+    dbWriter: db,
+    log,
+  });
+
+  const r = results[0];
+  assert.equal(r.outcome, "repaired");
+  assert.equal(r.rowsWritten, 1);
+  assert.equal(db.prices.get(priceEntity.haEntityId + "@" + missing).price, 0.21,
+    "the genuine 15:13 observation is the hour's price, not the clamped 0.19");
 });

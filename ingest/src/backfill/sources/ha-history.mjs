@@ -34,6 +34,13 @@ export function haHttpBaseFromWsUrl(wsUrl) {
  * @param {number} options.endMs - range end (exclusive), epoch milliseconds
  * @param {Function} [options.fetchFn] - injectable fetch (tests, verification)
  * @param {number} [options.timeoutMs=30000]
+ * @param {boolean} [options.skipInitialState=false] - leave out the synthetic
+ *   start-of-period state. By default the history API answers with one extra
+ *   synthetic state beyond the recorded ones: the state current at the
+ *   requested start, with last_changed and last_updated clamped to exactly
+ *   the start instant (HA core: include_start_time_state is presence-based).
+ *   When true, the bare presence-based query parameter skip_initial_state is
+ *   appended so that only genuinely recorded, in-range states are returned.
  * @returns {Promise<{states: Array<{entity_id: string, state: string, last_updated_ts: number}>} |
  *   {error: {code: string, message: string}}>} never throws
  */
@@ -46,10 +53,15 @@ export async function fetchEntityHistory(options) {
     endMs,
     fetchFn = fetch,
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    skipInitialState = false,
   } = options;
   const startISO = new Date(startMs).toISOString();
   const endISO = new Date(endMs).toISOString();
-  const url = `${httpBase.replace(/\/$/, "")}/api/history/period/${startISO}?end_time=${encodeURIComponent(endISO)}&filter_entity_id=${encodeURIComponent(entityId)}`;
+  const url =
+    `${httpBase.replace(/\/$/, "")}/api/history/period/${startISO}?end_time=${encodeURIComponent(endISO)}&filter_entity_id=${encodeURIComponent(entityId)}` +
+    // Presence-based per HA core: its mere presence (no value) disables the
+    // synthetic start-of-period state.
+    (skipInitialState ? "&skip_initial_state" : "");
   try {
     const res = await fetchFn(url, {
       headers: { Authorization: `Bearer ${token}` },
