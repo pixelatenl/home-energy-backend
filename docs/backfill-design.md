@@ -285,6 +285,9 @@ permanent ranges. Every missing hour is repaired from two sources in order:
    and restored). The fix was the entity swap to the configured price entity
    described above.
 
+   The history API's synthetic start-of-period state (below) is skipped for
+   this source too, with the same `skip_initial_state` request.
+
 A source that yields nothing for an hour does not fail the run. Rows are
 written with tariff `normaal` and source `zonneplan-backfill` (the same
 writePrice shape as the live path, additive source), only for hours detected
@@ -302,6 +305,25 @@ dayOf semantics as the engine) it was observed in, and the first observation
 per local day wins, so an evening pre-publication of the next day's price
 never leaks into the current day. Uncovered days follow the same
 retry-then-permanent rule as the price hours.
+
+The daily gas price entity has a predictable nightly pattern: its state
+transitions to unknown around local midnight, the new day's price publishes
+around 03:15 local on weekdays and in the late morning in the weekend, and
+between midnight and publication the current day is honestly missing — the
+hourly backfill runs keep retrying it until the real observation exists. The
+HA history API would defeat that honesty by default: besides the recorded
+states it returns one synthetic state — the state current at the requested
+period start, with `last_changed`/`last_updated` clamped to exactly the start
+instant. A repair fetch starts at the missing day's local midnight, so that
+synthetic state is the previous day's price stamped at the new day's midnight;
+with first-observation-per-day semantics it becomes the new day's price hours
+before the real publication (the 31 October 2026 midnight phantom, the wrong
+1.9830135 written for 31 October instead of 2.0432654). Both price sources
+therefore send the documented presence-based query parameter
+`skip_initial_state` ("leave out the state at the start of the period"), so
+only genuinely recorded, in-range observations may produce a price; the
+counter path keeps the default, because the counter repair requests its own
+padding and needs the state at its requested start.
 
 Both paths record their provenance per run: `run_kind` (auto for the hourly
 timer, cli for manual runs) and `source` (the plugin that supplied the

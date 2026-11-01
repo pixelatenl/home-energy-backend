@@ -9,9 +9,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseForecastHours } from "../src/backfill/sources/price-forecast.mjs";
 import { fetchEntityHistory } from "../src/backfill/sources/ha-history.mjs";
-import { hourlyPricesFromStates } from "../src/backfill/sources/price-history.mjs";
+import { hourlyPricesFromStates, fetchPriceEntityHistory } from "../src/backfill/sources/price-history.mjs";
 import {
   dailyPricesFromStates,
+  fetchGasPriceHistory,
   localDayStartMs,
   nextDay,
 } from "../src/backfill/sources/gas-price-history.mjs";
@@ -275,4 +276,99 @@ test("fetchEntityHistory: the start is the single path segment, the end time is 
   assert.deepEqual(result.states, [
     { entity_id: "sensor.grid_consumption_total", state: "104.5", last_updated_ts: 1770000000 },
   ]);
+});
+
+test("fetchEntityHistory: skipInitialState appends the bare presence-based skip_initial_state parameter", async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => [[]] };
+  };
+
+  await fetchEntityHistory({
+    httpBase: "http://localhost:8123",
+    token: "secret",
+    entityId: "sensor.grid_consumption_total",
+    startMs: Date.parse("2026-02-10T00:00:00Z"),
+    endMs: Date.parse("2026-02-10T12:00:00Z"),
+    skipInitialState: true,
+    fetchFn,
+  });
+
+  // HA core is presence-based: the parameter carries no value, its mere
+  // presence disables the synthetic start-of-period state.
+  assert.equal(
+    calls[0],
+    "http://localhost:8123/api/history/period/2026-02-10T00:00:00.000Z" +
+      "?end_time=2026-02-10T12%3A00%3A00.000Z" +
+      "&filter_entity_id=sensor.grid_consumption_total" +
+      "&skip_initial_state"
+  );
+});
+
+test("fetchEntityHistory: without the option the synthetic start state is requested (parameter absent)", async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => [[]] };
+  };
+
+  await fetchEntityHistory({
+    httpBase: "http://localhost:8123",
+    token: "secret",
+    entityId: "sensor.grid_consumption_total",
+    startMs: Date.parse("2026-02-10T00:00:00Z"),
+    endMs: Date.parse("2026-02-10T12:00:00Z"),
+    fetchFn,
+  });
+
+  // The counter repair path needs the state at its requested start (its own
+  // padding), so the default must keep HA's clamped start-of-period state.
+  assert.equal(
+    calls[0],
+    "http://localhost:8123/api/history/period/2026-02-10T00:00:00.000Z" +
+      "?end_time=2026-02-10T12%3A00%3A00.000Z" +
+      "&filter_entity_id=sensor.grid_consumption_total"
+  );
+  assert.equal(new URL(calls[0]).searchParams.has("skip_initial_state"), false);
+});
+
+test("fetchGasPriceHistory: the request URL includes skip_initial_state", async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => [[]] };
+  };
+
+  await fetchGasPriceHistory({
+    httpBase: "http://localhost:8123",
+    token: "secret",
+    entityId: "sensor.zonneplan_gas_price_daily",
+    startMs: Date.parse("2026-10-30T23:00:00Z"), // local midnight of 31 October
+    endMs: Date.parse("2026-10-31T23:00:00Z"),
+    fetchFn,
+  });
+
+  assert.equal(new URL(calls[0]).searchParams.has("skip_initial_state"), true,
+    "the day price source must never see the clamped previous-day state");
+});
+
+test("fetchPriceEntityHistory: the request URL includes skip_initial_state", async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => [[]] };
+  };
+
+  await fetchPriceEntityHistory({
+    httpBase: "http://localhost:8123",
+    token: "secret",
+    entityId: "sensor.zonneplan_current_electricity_price",
+    startMs: Date.parse("2026-02-10T15:00:00Z"),
+    endMs: Date.parse("2026-02-10T17:00:00Z"),
+    fetchFn,
+  });
+
+  assert.equal(new URL(calls[0]).searchParams.has("skip_initial_state"), true,
+    "the hour price source must never see the clamped previous-hour state");
 });
