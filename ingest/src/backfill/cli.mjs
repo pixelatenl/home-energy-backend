@@ -26,8 +26,8 @@ import { DbWriter } from "../db.mjs";
 import { DAY_MS, dayOf, hourOf } from "../buckets.mjs";
 import { detectBucketGaps, detectPriceGaps, detectGasPriceGaps } from "./detect.mjs";
 import { fetchEntityHistory, haHttpBaseFromWsUrl } from "./sources/ha-history.mjs";
-import { fetchPriceForecast, TARIFF_FORECAST_ENTITY_ID } from "./sources/price-forecast.mjs";
-import { fetchTariffHistory } from "./sources/price-history.mjs";
+import { fetchPriceForecast } from "./sources/price-forecast.mjs";
+import { fetchPriceEntityHistory } from "./sources/price-history.mjs";
 import { fetchGasPriceHistory } from "./sources/gas-price-history.mjs";
 import {
   runBackfill,
@@ -177,6 +177,11 @@ async function commandRepair(entities, args) {
     const fetchHistory = (entityId, startMs, endMs) =>
       fetchEntityHistory({ httpBase, token: HA_TOKEN, entityId, startMs, endMs });
 
+    // The price history fallback reads the configured hourly price entity:
+    // the first kind "price" entity from the (already filtered) config, the
+    // same one repair.mjs uses as the price audit entity.
+    const priceEntity = entities.find((e) => e.kind === "price");
+
     const { fromMs, toMs, results } = await runBackfill({
       entities,
       lookbackDays: Number(process.env.EMS_BACKFILL_LOOKBACK_DAYS ?? 7) || 7,
@@ -197,7 +202,7 @@ async function commandRepair(entities, args) {
       loadPriceHours: createPriceHoursLoader(pool),
       fetchPriceForecast: () => fetchPriceForecast({ httpBase, token: HA_TOKEN }),
       fetchPriceHistory: (startMs, endMs) =>
-        fetchTariffHistory({ httpBase, token: HA_TOKEN, entityId: TARIFF_FORECAST_ENTITY_ID, startMs, endMs }),
+        fetchPriceEntityHistory({ httpBase, token: HA_TOKEN, entityId: priceEntity.haEntityId, startMs, endMs }),
       loadGasDays: createGasDaysLoader(pool),
       fetchGasHistory: (cfg, startMs, endMs) =>
         fetchGasPriceHistory({

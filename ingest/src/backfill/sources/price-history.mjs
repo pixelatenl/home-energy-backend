@@ -1,11 +1,16 @@
 // Price history fallback source for the backfill mechanism (see
 // docs/backfill-design.md, section 7): hours outside the forecast's rolling
-// window are recovered from the recorder history of the tariff entity.
-// Every state observation is mapped to the start of its hour; when several
-// observations land in the same hour, the LAST one before the hour boundary
-// wins, matching the engine's writePrice-on-change upsert semantics (the
-// live worker upserts on every state change, so the last change of the hour
-// is the stored price).
+// window are recovered from the recorder history of the configured hourly
+// price entity (kind "price" in config.json, e.g.
+// sensor.zonneplan_current_electricity_price). The worker itself writes
+// prices from this entity on every state change; it publishes one state per
+// hour, around 13 minutes past the hour boundary, and its state is the
+// hourly price in display units. Every state observation is mapped to the
+// start of its hour; when several observations land in the same hour (an
+// in-hour revision), the LAST one before the hour boundary wins, matching
+// the engine's writePrice-on-change upsert semantics (the live worker
+// upserts on every state change, so the last change of the hour is the
+// stored price).
 //
 // Fail-soft: fetch errors return a typed {error} object, never throw past
 // the plugin boundary.
@@ -41,15 +46,15 @@ export function hourlyPricesFromStates(states) {
 }
 
 /**
- * Fetch the tariff entity's recorder history for a range and map it to
- * hourly prices.
+ * Fetch the configured hourly price entity's recorder history for a range
+ * and map it to hourly prices.
  *
  * @param {object} options - as for fetchEntityHistory (httpBase, token,
  *   entityId, startMs, endMs, fetchFn, timeoutMs)
  * @returns {Promise<{hours: Array<{startMs: number, priceEur: number}>} |
  *   {error: {code: string, message: string}}>} never throws
  */
-export async function fetchTariffHistory(options) {
+export async function fetchPriceEntityHistory(options) {
   const result = await fetchEntityHistory(options);
   if (result.error) return result;
   return { hours: hourlyPricesFromStates(result.states) };

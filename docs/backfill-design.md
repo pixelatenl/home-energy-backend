@@ -152,7 +152,7 @@ how the mechanism is verified without touching a production database.
 | ingest/src/backfill/detect.mjs | pure gap detectors: `detectPriceGaps`, `detectGasPriceGaps`, `detectBucketGaps`, `medianIntervalBuckets`. No I/O. |
 | ingest/src/backfill/sources/ha-history.mjs | HA REST history client (`fetchEntityHistory`) and `haHttpBaseFromWsUrl`. Fail-soft: returns a typed `{error}` object, never throws past the plugin boundary. |
 | ingest/src/backfill/sources/price-forecast.mjs | Zonneplan tariff forecast (`fetchPriceForecast`, `parseForecastHours`): 15-minute blocks averaged into hours, 1e-7 EUR/kWh converted to EUR. Only hours the attribute covers are provided. |
-| ingest/src/backfill/sources/price-history.mjs | price fallback (`fetchTariffHistory`, `hourlyPricesFromStates`): recorder history of the tariff entity, last observation per hour wins. |
+| ingest/src/backfill/sources/price-history.mjs | price fallback (`fetchPriceEntityHistory`, `hourlyPricesFromStates`): recorder history of the configured hourly price entity, last observation per hour wins. |
 | ingest/src/backfill/sources/gas-price-history.mjs | gas price source (`fetchGasPriceHistory`, `dailyPricesFromStates`, `localDayStartMs`): recorder history of the configured gas price entity, first observation per local day wins. |
 | ingest/src/backfill/repair.mjs | orchestrator `runBackfill` plus the SQL loaders (rows, deltas, price hours, gas days). Replay, corroboration, budget, price/gas repair, permanent registration, catch-up reporting, outcomes. |
 | ingest/src/backfill/catchup.mjs | pure class 2 catch-up detector: `flagAttributionSuspects`, `medianOf`. No I/O. |
@@ -267,10 +267,23 @@ permanent ranges. Every missing hour is repaired from two sources in order:
    are averaged (up to 4) and the amount is converted from 1e-7 EUR/kWh to
    EUR/kWh. Only hours the attribute actually covers are provided; hours
    before the rolling window start fall through to the fallback.
-2. The recorder history of the tariff entity (plugin `zonneplan-history`):
-   every state observation is mapped to the start of its hour and the last
-   observation before the hour boundary wins, matching the engine's
+2. The recorder history of the configured hourly price entity (plugin
+   `zonneplan-history`): the kind "price" entity from config.json (e.g.
+   sensor.zonneplan_current_electricity_price) publishes one state per hour,
+   around 13 minutes past the hour boundary, its state being the hourly
+   price in display units (the same entity the live worker writes prices
+   from). Every state observation is mapped to the start of its hour and the
+   last observation before the hour boundary wins, matching the engine's
    writePrice-on-change upsert semantics.
+
+   Correction history: until 1 November 2026 this fallback was wired to the
+   quarter-hourly tariff entity
+   (sensor.zonneplan_current_quarter_hourly_electricity_tariff), which
+   changes state every 15 minutes, so last-observation-per-hour produced the
+   tariff of the LAST quarter block instead of the hourly price — proven by
+   the twelve phantom price values of the 30–31 October incident (reconciled
+   and restored). The fix was the entity swap to the configured price entity
+   described above.
 
 A source that yields nothing for an hour does not fail the run. Rows are
 written with tariff `normaal` and source `zonneplan-backfill` (the same
