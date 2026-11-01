@@ -11,7 +11,7 @@
 //
 // Hourly prices (kind "price"): missing hours on the hourly grid are
 // repaired from the Zonneplan forecast attribute first (plugin
-// zonneplan-forecast) and from the recorder history of the tariff entity as
+// zonneplan-forecast) and from the recorder history of the price entity as
 // the fallback (plugin zonneplan-history), rows labelled zonneplan-backfill.
 // Hours the sources do not cover stay missing: recent ones are retried on
 // the next run (outcome partial), hours older than the recorder retention
@@ -227,8 +227,8 @@ export async function runBackfill(options = {}) {
     }
   }
   // One price pipeline per run: every kind "price" entity shares the same
-  // source (the tariff entity) and the same price table, so the first
-  // configured price entity is the audit id for the run.
+  // source (the configured hourly price entity) and the same price table, so
+  // the first configured price entity is the audit id for the run.
   if (priceCandidates.length > 0) {
     results.push(await repairPriceEntity(priceCandidates[0], c));
   }

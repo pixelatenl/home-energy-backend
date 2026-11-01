@@ -2,8 +2,8 @@
 // I/O). Run with: node --test test/ (or: npm test)
 //
 // Fixtures mirror the real Zonneplan attribute shapes: the forecast blocks
-// carry amounts in 1e-7 EUR/kWh, the tariff entity states carry prices in
-// EUR, and the gas price entity states carry EUR per m3.
+// carry amounts in 1e-7 EUR/kWh, the hourly price entity states carry
+// prices in EUR, and the gas price entity states carry EUR per m3.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -101,7 +101,7 @@ test("forecast: an unavailable entity or a missing attribute yields no hours", (
 
 function stateAt(iso, value) {
   return {
-    entity_id: "sensor.zonneplan_current_quarter_hourly_electricity_tariff",
+    entity_id: "sensor.zonneplan_current_electricity_price",
     state: String(value),
     last_updated_ts: Date.parse(iso) / 1000,
   };
@@ -131,6 +131,36 @@ test("price history: non-numeric states are ignored", () => {
   assert.deepEqual(hours, [
     { startMs: Date.parse("2026-02-10T15:00:00Z"), priceEur: 0.31 },
   ]);
+});
+
+test("price history: a single state per hour at ~13 minutes past the boundary is that hour's exact price", () => {
+  // The real hourly price entity (sensor.zonneplan_current_electricity_price)
+  // publishes one state per hour, around 13 minutes past the boundary, and
+  // its state is the hourly price in display units: the mapping must return
+  // it unchanged for that hour.
+  const hours = hourlyPricesFromStates([
+    stateAt("2026-02-10T15:13:00Z", 0.23),
+    stateAt("2026-02-10T16:13:00Z", 0.19),
+  ]);
+  assert.deepEqual(hours, [
+    { startMs: Date.parse("2026-02-10T15:00:00Z"), priceEur: 0.23 },
+    { startMs: Date.parse("2026-02-10T16:00:00Z"), priceEur: 0.19 },
+  ], "each hour gets exactly the price its single state carried");
+});
+
+test("price history: a within-hour revision resolves last-wins", () => {
+  // The live worker upserts on every state change, so a corrected price
+  // published later in the hour must replace the earlier observation, never
+  // average with it.
+  const hours = hourlyPricesFromStates([
+    stateAt("2026-02-10T15:13:00Z", 0.23),
+    stateAt("2026-02-10T15:42:00Z", 0.27),
+    stateAt("2026-02-10T16:13:00Z", 0.19),
+  ]);
+  assert.deepEqual(hours, [
+    { startMs: Date.parse("2026-02-10T15:00:00Z"), priceEur: 0.27 },
+    { startMs: Date.parse("2026-02-10T16:00:00Z"), priceEur: 0.19 },
+  ], "the revised 15:42 price wins over the 15:13 one");
 });
 
 // ---------------------------------------------------------------------------
