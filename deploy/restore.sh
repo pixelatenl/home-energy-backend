@@ -125,7 +125,7 @@ Follow these commands on the server to finish the recovery:
       SELECT count(*) AS backfill_log FROM backfill_log;
       SELECT count(*) AS solar_forecast_daily FROM solar_forecast_daily;"
   docker exec ems-timescaledb psql -U $DB_USER -d $DB_NAME -c "
-      SELECT max(time) FROM measurement;"
+      SELECT max(ts) FROM measurement;"
 
   # 5. When satisfied, restart the ingest worker.
   sudo systemctl start ems-ingest.service

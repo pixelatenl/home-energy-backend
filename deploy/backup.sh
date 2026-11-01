@@ -118,8 +118,9 @@ on_error() {
 }
 trap on_error ERR
 
-# Single query so all live counts come from one snapshot; captured immediately
-# after pg_basebackup returns to keep the live-vs-rehearsal race minimal.
+# Used for all three snapshots (pre, post, and rehearsal) so each count set
+# comes from one consistent read; the comparison is the pre <= rehearsal <=
+# post bounds check described in the bounds explanation block above.
 count_query() {
     local t query=""
     for t in "${DB_TABLES[@]}"; do

@@ -71,13 +71,14 @@ postgres user, and prints the exact follow-up commands: stop the stack, swap
 queries. It never touches `deploy/data/timescaledb` unless you name it as the
 target explicitly.
 
-Legacy `.sql.gz` files from the old db-backup container in
-`backups/daily/`, `backups/weekly/`, `backups/monthly/` and `backups/last/`
-are **known-defective** (empty price/energy_delta, raw chunk blocks) and are
-pending a separate quarantine decision — do not restore from them. The
-pre-backfill snapshots `energy_pre_backfill_20261030_1838.dump` and
-`ha_v2_pre_backfill_20261030_1846.db` are unrelated to this chain and remain
-untouched.
+History: before the base-backup chain, the old db-backup container produced
+legacy `.sql.gz` files in `backups/daily/`, `backups/weekly/`,
+`backups/monthly/` and `backups/last/`. That pg_dump chain was defective
+(hypertable data in raw `_timescaledb_internal` chunk blocks, empty
+price/energy_delta parents). It was retired on 2026-11-01: the owner deleted
+all legacy `.sql.gz` files and the four legacy folders, along with the
+pre-backfill forensic snapshots. Since then the only backup tree is
+`backups/base/` — no other backup files exist.
 
 ## Backfill repair (hourly timer)
 
